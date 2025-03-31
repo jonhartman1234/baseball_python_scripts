@@ -1,0 +1,2151 @@
+#Analyzes two years of pitching performance
+import statsapi
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import json
+import time
+import requests
+import os
+from typing import Dict, List, Tuple, Optional
+import pybaseball
+from pybaseball import statcast_pitcher, playerid_lookup, pitching_stats, statcast
+import warnings
+warnings.filterwarnings('ignore')
+
+class MLBPitcherYearComparer:
+    def __init__(self):
+        self.pitcher = None
+        self.season1 = None  # First season to compare
+        self.season2 = None  # Second season to compare
+        self.game_logs1 = None  # Game logs for first season
+        self.game_logs2 = None  # Game logs for second season
+        self.pitch_data = None
+        self.analysis_results = {}
+        self.player_id = None
+        self.mlbam_id = None
+        self.good_threshold = 60  # Default threshold for good outings
+        self.bad_threshold = 40   # Default threshold for bad outings
+        self.good_outings1 = None  # Good outings for season 1
+        self.bad_outings1 = None   # Bad outings for season 1
+        self.good_outings2 = None  # Good outings for season 2
+        self.bad_outings2 = None   # Bad outings for season 2
+        self.season_stats = {}    # Store overall season stats
+        
+    def search_pitcher(self, name):
+        """Search for a pitcher by name using MLB Stats API"""
+        try:
+            search_results = statsapi.lookup_player(name)
+            pitchers = [player for player in search_results 
+                       if player.get('primaryPosition', {}).get('code', '') == '1']
+            return pitchers if pitchers else search_results
+        except Exception as e:
+            print(f"Error searching for player via MLB Stats API: {e}")
+            # Try using pybaseball as fallback
+            try:
+                player_id_df = playerid_lookup(name.split()[1], name.split()[0])
+                if not player_id_df.empty:
+                    # Convert pybaseball results to format similar to statsapi
+                    search_results = []
+                    for _, row in player_id_df.iterrows():
+                        search_results.append({
+                            'id': int(row['key_mlbam']),
+                            'fullName': f"{row['name_first']} {row['name_last']}",
+                            'primaryPosition': {'code': '1', 'name': 'Pitcher'},
+                            'currentTeam': {'name': row.get('team_name', 'Unknown')},
+                            'key_fangraphs': row.get('key_fangraphs', None)
+                        })
+                    return search_results
+            except Exception as e2:
+                print(f"Error searching via pybaseball: {e2}")
+            return []
+    
+    def select_pitcher(self, search_results):
+        """Let user select a pitcher from search results"""
+        print("\nFound the following players:")
+        for i, player in enumerate(search_results):
+            position = player.get('primaryPosition', {}).get('name', 'Unknown')
+            team = player.get('currentTeam', {}).get('name', 'Free Agent')
+            print(f"{i+1}. {player['fullName']} - {position} - {team}")
+        
+        selection = int(input("\nEnter the number of the player to analyze: "))
+        self.pitcher = search_results[selection-1]
+        self.mlbam_id = self.pitcher['id']
+        # Also get FanGraphs ID if available
+        if 'key_fangraphs' in self.pitcher:
+            self.fg_id = self.pitcher['key_fangraphs']
+        return self.pitcher
+    
+    def get_game_logs(self, season):
+        """Get game logs for the selected pitcher in given season using MLB Stats API and pybaseball"""
+        print(f"Fetching game logs for player ID {self.mlbam_id} for season {season}...")
+        
+        # Try MLB Stats API directly first (most reliable)
+        try:
+            print("Trying MLB Stats API...")
+            stats_params = {
+                "personId": self.mlbam_id,
+                "hydrate": f"stats(group=pitching,type=gameLog,season={season})"
+            }
+            
+            player_data = statsapi.get("person", stats_params)
+            
+            # Extract game logs if available
+            game_logs = []
+            
+            if 'people' in player_data and len(player_data['people']) > 0:
+                if 'stats' in player_data['people'][0]:
+                    stats = player_data['people'][0]['stats']
+                    for stat_group in stats:
+                        if stat_group.get('type', {}).get('displayName') == 'gameLog':
+                            game_logs = stat_group.get('splits', [])
+                            
+                # If we got game logs, convert to DataFrame
+                if game_logs:
+                    # Extract relevant data into a list of dicts
+                    game_log_data = []
+                    for game in game_logs:
+                        game_dict = {
+                            'game_id': game.get('game', {}).get('gamePk'),
+                            'date': game.get('date'),
+                            'opponent': game.get('opponent', {}).get('name', 'Unknown'),
+                            'team_result': game.get('isWin', False),
+                        }
+                        
+                        # Add pitching stats
+                        for stat, value in game.get('stat', {}).items():
+                            game_dict[stat] = value
+                            
+                        game_log_data.append(game_dict)
+                    
+                    if game_log_data:
+                        game_logs_df = pd.DataFrame(game_log_data)
+                        
+                        # Convert numeric columns
+                        numeric_cols = ['inningsPitched', 'hits', 'runs', 'earnedRuns', 'baseOnBalls', 
+                                      'strikeOuts', 'homeRuns', 'era']
+                        
+                        for col in numeric_cols:
+                            if col in game_logs_df.columns:
+                                game_logs_df[col] = pd.to_numeric(game_logs_df[col], errors='coerce')
+                                
+                        # Convert innings pitched to numeric (handle fractional innings)
+                        if 'inningsPitched' in game_logs_df.columns:
+                            game_logs_df['ip_numeric'] = game_logs_df['inningsPitched'].apply(
+                                lambda x: float(x) if isinstance(x, (int, float)) or (isinstance(x, str) and x.isdigit()) else 
+                                int(x.split('.')[0]) + int(x.split('.')[1])/3 if isinstance(x, str) and '.' in x else float(x)
+                            )
+                            
+                        print(f"Successfully retrieved {len(game_logs_df)} game logs from MLB Stats API")
+                        
+                        # Add game date as datetime for easier filtering
+                        if 'date' in game_logs_df.columns:
+                            game_logs_df['game_date'] = pd.to_datetime(game_logs_df['date'])
+                        
+                        # Add season column
+                        game_logs_df['season'] = season
+                        
+                        return game_logs_df
+        except Exception as e:
+            print(f"Error fetching game logs from MLB Stats API: {e}")
+        
+        # Try to get game logs from pybaseball (with retries)
+        max_retries = 3
+        retry_delay = 2  # seconds
+        
+        for attempt in range(max_retries):
+            try:
+                print(f"Trying pybaseball (attempt {attempt+1}/{max_retries})...")
+                
+                # Get season stats for the pitcher
+                season_stats = pitching_stats(season, season, qual=0)
+                
+                # Filter for our pitcher by MLBAM ID
+                pitcher_season = season_stats[season_stats['IDfg'] == self.mlbam_id]
+                
+                if not pitcher_season.empty:
+                    print(f"Found season stats via pybaseball")
+                    
+                    # Create a simple DataFrame from the season stats
+                    # This is a fallback if we can't get game logs
+                    game_log_data = [{
+                        'game_id': 0,  # placeholder
+                        'date': f"{season}-07-01",  # middle of season placeholder
+                        'game_date': pd.to_datetime(f"{season}-07-01"),
+                        'opponent': 'Multiple',
+                        'ip_numeric': pitcher_season['IP'].values[0] if 'IP' in pitcher_season.columns else 0,
+                        'inningsPitched': str(pitcher_season['IP'].values[0]) if 'IP' in pitcher_season.columns else "0.0",
+                        'hits': pitcher_season['H'].values[0] if 'H' in pitcher_season.columns else 0,
+                        'runs': pitcher_season['R'].values[0] if 'R' in pitcher_season.columns else 0,
+                        'earnedRuns': pitcher_season['ER'].values[0] if 'ER' in pitcher_season.columns else 0,
+                        'baseOnBalls': pitcher_season['BB'].values[0] if 'BB' in pitcher_season.columns else 0,
+                        'strikeOuts': pitcher_season['SO'].values[0] if 'SO' in pitcher_season.columns else 0,
+                        'homeRuns': pitcher_season['HR'].values[0] if 'HR' in pitcher_season.columns else 0,
+                        'era': pitcher_season['ERA'].values[0] if 'ERA' in pitcher_season.columns else 0,
+                        'season': season
+                    }]
+                    
+                    fallback_df = pd.DataFrame(game_log_data)
+                    print(f"Created fallback seasonal stats entry (no game logs available)")
+                    
+                    # Mark this as a fallback dataset
+                    fallback_df['is_fallback'] = True
+                    
+                    return fallback_df
+                
+                break  # If we get here without error, break the retry loop
+                
+            except Exception as e:
+                print(f"Error in pybaseball attempt {attempt+1}: {e}")
+                if attempt < max_retries - 1:
+                    print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+            
+        # Final attempt: Try Statcast with better error handling
+        try:
+            print("Trying Statcast data...")
+            
+            # Get Statcast data for the pitcher for the entire season
+            start_date = f"{season}-03-01"
+            end_date = f"{season}-11-30"
+            
+            pitcher_data = statcast_pitcher(start_date, end_date, self.mlbam_id)
+            
+            if not pitcher_data.empty:
+                # Group by game_date to create game logs
+                game_dates = pitcher_data['game_date'].unique()
+                
+                game_log_data = []
+                
+                for date in game_dates:
+                    game_data = pitcher_data[pitcher_data['game_date'] == date]
+                    
+                    try:
+                        # Get game ID safely
+                        game_id = game_data['game_pk'].iloc[0] if 'game_pk' in game_data.columns else 0
+                        
+                        # Get team information safely
+                        home_team = game_data['home_team'].iloc[0] if 'home_team' in game_data.columns else 'Unknown'
+                        away_team = game_data['away_team'].iloc[0] if 'away_team' in game_data.columns else 'Unknown'
+                        
+                        # Try different methods to determine pitcher's team
+                        opponent = 'Unknown'
+                        if 'pitcher_team' in game_data.columns:
+                            pitcher_team = game_data['pitcher_team'].iloc[0]
+                            opponent = away_team if pitcher_team == home_team else home_team
+                        elif 'p_throws' in game_data.columns and 'stand' in game_data.columns:
+                            # Try to infer team from other data
+                            pitch_counts = {home_team: 0, away_team: 0}
+                            for _, pitch in game_data.iterrows():
+                                if pitch.get('inning_topbot') == 'Bot':
+                                    pitch_counts[away_team] += 1
+                                else:
+                                    pitch_counts[home_team] += 1
+                            
+                            # Pitcher likely belongs to team with more pitches
+                            pitcher_team = home_team if pitch_counts[home_team] > pitch_counts[away_team] else away_team
+                            opponent = away_team if pitcher_team == home_team else home_team
+                        
+                        # Calculate basic stats safely
+                        total_pitches = len(game_data)
+                        
+                        # Check if 'events' column exists
+                        if 'events' in game_data.columns:
+                            hits = sum(game_data['events'].isin(['single', 'double', 'triple', 'home_run']))
+                            strikeouts = sum(game_data['events'] == 'strikeout')
+                            walks = sum(game_data['events'] == 'walk')
+                            home_runs = sum(game_data['events'] == 'home_run')
+                            
+                            # Estimate innings pitched (very rough approximation)
+                            batters_faced = game_data['at_bat_number'].nunique() if 'at_bat_number' in game_data.columns else 0
+                            outs_recorded = sum(game_data['events'].isin(['strikeout', 'field_out', 'force_out', 'grounded_into_double_play', 'double_play', 'triple_play']))
+                            innings_pitched = outs_recorded / 3
+                        else:
+                            # Default values if events column is missing
+                            hits = walks = strikeouts = home_runs = 0
+                            batters_faced = 0
+                            innings_pitched = 0
+                        
+                        # Create game log entry
+                        game_log = {
+                            'game_id': game_id,
+                            'date': date,
+                            'game_date': pd.to_datetime(date),
+                            'opponent': opponent,
+                            'ip_numeric': innings_pitched,
+                            'inningsPitched': str(int(innings_pitched)) + "." + str(int((innings_pitched % 1) * 3)),
+                            'hits': hits,
+                            'baseOnBalls': walks,
+                            'strikeOuts': strikeouts,
+                            'homeRuns': home_runs,
+                            'batters_faced': batters_faced,
+                            'total_pitches': total_pitches,
+                            'season': season
+                        }
+                        
+                        game_log_data.append(game_log)
+                    except Exception as e3:
+                        print(f"Error processing game from {date}: {e3}")
+                        # Continue to next game
+                
+                if game_log_data:
+                    game_logs_df = pd.DataFrame(game_log_data)
+                    print(f"Successfully constructed {len(game_logs_df)} game logs from Statcast data")
+                    
+                    return game_logs_df
+                else:
+                    print("No valid games could be processed from Statcast data.")
+            else:
+                print("No Statcast data found for this pitcher in the specified season.")
+        
+        except Exception as e2:
+            print(f"Error constructing game logs from Statcast: {e2}")
+        
+        # Final fallback - create a minimal empty dataframe with the right columns
+        print("All data sources failed. Creating empty dataset with correct structure.")
+        empty_df = pd.DataFrame({
+            'game_id': [],
+            'date': [],
+            'game_date': [],
+            'opponent': [],
+            'ip_numeric': [],
+            'inningsPitched': [],
+            'hits': [],
+            'baseOnBalls': [],
+            'strikeOuts': [],
+            'homeRuns': [],
+            'season': []
+        })
+        
+        # Add a flag to indicate this is an empty fallback dataset
+        empty_df['is_fallback'] = True
+        empty_df['is_empty'] = True
+        
+        return empty_df
+    
+    def fetch_data_for_both_seasons(self, season1, season2):
+        """Fetch data for both seasons to compare"""
+        self.season1 = season1
+        self.season2 = season2
+        
+        print(f"Fetching data for {self.pitcher['fullName']} for seasons {season1} and {season2}...")
+        
+        # Get game logs for both seasons
+        self.game_logs1 = self.get_game_logs(season1)
+        self.game_logs2 = self.get_game_logs(season2)
+        
+        # Check for fallback data
+        s1_fallback = 'is_fallback' in self.game_logs1.columns and self.game_logs1['is_fallback'].any()
+        s2_fallback = 'is_fallback' in self.game_logs2.columns and self.game_logs2['is_fallback'].any()
+        
+        # Check for empty fallback data
+        s1_empty = 'is_empty' in self.game_logs1.columns and self.game_logs1['is_empty'].any()
+        s2_empty = 'is_empty' in self.game_logs2.columns and self.game_logs2['is_empty'].any()
+        
+        # Combine logs but keep track of which season they're from
+        if (not self.game_logs1.empty and not s1_empty) and (not self.game_logs2.empty and not s2_empty):
+            self.combined_game_logs = pd.concat([self.game_logs1, self.game_logs2])
+            
+            if s1_fallback and s2_fallback:
+                print(f"Using limited fallback data for both seasons")
+            elif s1_fallback:
+                print(f"Using limited fallback data for {season1} and full data for {season2}")
+            elif s2_fallback:
+                print(f"Using full data for {season1} and limited fallback data for {season2}")
+            else:
+                print(f"Successfully retrieved data for both seasons: {len(self.game_logs1)} games in {season1} and {len(self.game_logs2)} games in {season2}")
+                
+            return True
+        elif not self.game_logs1.empty and not s1_empty:
+            print(f"Only found data for {season1}: {len(self.game_logs1)} games")
+            # If we have at least one season, we can still do some analysis
+            self.combined_game_logs = self.game_logs1.copy()
+            return True if not s1_fallback else False
+        elif not self.game_logs2.empty and not s2_empty:
+            print(f"Only found data for {season2}: {len(self.game_logs2)} games")
+            # If we have at least one season, we can still do some analysis
+            self.combined_game_logs = self.game_logs2.copy()
+            return True if not s2_fallback else False
+        else:
+            print(f"No valid data found for either season")
+            
+            # Try to use alternative data sources - MLB.com API directly
+            print("Attempting to use MLB.com API directly as a last resort...")
+            try:
+                s1_data = self.get_mlb_api_season_data(season1)
+                s2_data = self.get_mlb_api_season_data(season2)
+                
+                if s1_data is not None and s2_data is not None:
+                    self.game_logs1 = s1_data
+                    self.game_logs2 = s2_data
+                    self.combined_game_logs = pd.concat([self.game_logs1, self.game_logs2])
+                    print(f"Successfully retrieved season summary data from MLB.com API")
+                    return True
+                elif s1_data is not None:
+                    self.game_logs1 = s1_data
+                    self.combined_game_logs = s1_data.copy()
+                    print(f"Only found data for {season1} via MLB.com API")
+                    return True
+                elif s2_data is not None:
+                    self.game_logs2 = s2_data
+                    self.combined_game_logs = s2_data.copy()
+                    print(f"Only found data for {season2} via MLB.com API")
+                    return True
+                else:
+                    print("Could not retrieve data from MLB.com API")
+                    return False
+            except Exception as e:
+                print(f"Error retrieving alternative data: {e}")
+                return False
+    
+    def calculate_game_scores(self):
+        """Calculate Game Score (Bill James metric) for each outing"""
+        # Apply to combined game logs
+        if not hasattr(self, 'combined_game_logs') or self.combined_game_logs.empty:
+            print("No game logs available")
+            return
+            
+        # Check if we have the necessary columns
+        required_cols = ['ip_numeric', 'hits', 'runs', 'earnedRuns', 'baseOnBalls', 'strikeOuts']
+        missing_cols = [col for col in required_cols if col not in self.combined_game_logs.columns]
+        
+        if missing_cols:
+            print(f"Missing columns for Game Score calculation: {missing_cols}")
+            print("Using simplified Game Score formula")
+            
+            # Simplified formula if we're missing some columns
+            self.combined_game_logs['gameScore'] = 50
+            
+            if 'ip_numeric' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] += self.combined_game_logs['ip_numeric'] * 3
+                
+            if 'strikeOuts' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] += self.combined_game_logs['strikeOuts']
+                
+            if 'hits' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] -= 2 * self.combined_game_logs['hits']
+                
+            if 'earnedRuns' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] -= 4 * self.combined_game_logs['earnedRuns']
+            elif 'runs' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] -= 4 * self.combined_game_logs['runs']
+                
+            if 'baseOnBalls' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] -= self.combined_game_logs['baseOnBalls']
+        else:
+            # Bill James Game Score formula
+            self.combined_game_logs['gameScore'] = 50
+            
+            # Add points for outs (IP * 3)
+            self.combined_game_logs['gameScore'] += self.combined_game_logs['ip_numeric'] * 3
+            
+            # Add points for innings completed after 4th
+            self.combined_game_logs['gameScore'] += np.maximum(0, (self.combined_game_logs['ip_numeric'] - 4) * 2)
+            
+            # Add points for strikeouts
+            self.combined_game_logs['gameScore'] += self.combined_game_logs['strikeOuts']
+            
+            # Subtract points for hits
+            self.combined_game_logs['gameScore'] -= 2 * self.combined_game_logs['hits']
+            
+            # Subtract points for earned runs
+            self.combined_game_logs['gameScore'] -= 4 * self.combined_game_logs['earnedRuns']
+            
+            # Subtract points for unearned runs
+            if 'runs' in self.combined_game_logs.columns and 'earnedRuns' in self.combined_game_logs.columns:
+                self.combined_game_logs['gameScore'] -= 2 * (self.combined_game_logs['runs'] - self.combined_game_logs['earnedRuns'])
+            
+            # Subtract points for walks
+            self.combined_game_logs['gameScore'] -= self.combined_game_logs['baseOnBalls']
+        
+        # Round Game Score to integers
+        self.combined_game_logs['gameScore'] = self.combined_game_logs['gameScore'].round().astype(int)
+        
+        # Update season-specific dataframes
+        self.game_logs1 = self.combined_game_logs[self.combined_game_logs['season'] == self.season1]
+        self.game_logs2 = self.combined_game_logs[self.combined_game_logs['season'] == self.season2]
+        
+        return self.combined_game_logs
+        
+    def classify_performances(self):
+        """Classify outings as good, average, or bad based on Game Score thresholds for each season"""
+        if 'gameScore' not in self.combined_game_logs.columns:
+            print("Warning: Game Score not calculated, calculating now...")
+            self.calculate_game_scores()
+            
+        # Classify performances for both seasons
+        self.combined_game_logs['performance'] = 'average'
+        self.combined_game_logs.loc[self.combined_game_logs['gameScore'] >= self.good_threshold, 'performance'] = 'good'
+        self.combined_game_logs.loc[self.combined_game_logs['gameScore'] <= self.bad_threshold, 'performance'] = 'bad'
+        
+        # Update season-specific dataframes again to include performance classification
+        self.game_logs1 = self.combined_game_logs[self.combined_game_logs['season'] == self.season1]
+        self.game_logs2 = self.combined_game_logs[self.combined_game_logs['season'] == self.season2]
+        
+        # Create filtered dataframes for good and bad outings in each season
+        self.good_outings1 = self.game_logs1[self.game_logs1['performance'] == 'good']
+        self.bad_outings1 = self.game_logs1[self.game_logs1['performance'] == 'bad']
+        self.good_outings2 = self.game_logs2[self.game_logs2['performance'] == 'good']
+        self.bad_outings2 = self.game_logs2[self.game_logs2['performance'] == 'bad']
+        
+        # Print summary
+        print(f"\nPerformance Classification (Good: ≥{self.good_threshold}, Bad: ≤{self.bad_threshold})")
+        print(f"{self.season1} Season: {len(self.good_outings1)} good, {len(self.bad_outings1)} bad outings")
+        print(f"{self.season2} Season: {len(self.good_outings2)} good, {len(self.bad_outings2)} bad outings")
+        
+        return self.combined_game_logs
+    
+    def calculate_season_stats(self):
+        """Calculate overall stats for each season for comparison"""
+        stats = {}
+        
+        for season, logs in [(self.season1, self.game_logs1), (self.season2, self.game_logs2)]:
+            if logs.empty:
+                stats[season] = {}
+                continue
+                
+            season_stats = {}
+            
+            # Games and innings pitched
+            season_stats['games'] = len(logs)
+            season_stats['innings_pitched'] = logs['ip_numeric'].sum() if 'ip_numeric' in logs.columns else 0
+            
+            # Basic stats collection
+            for stat in ['strikeOuts', 'baseOnBalls', 'hits', 'homeRuns', 'runs', 'earnedRuns']:
+                if stat in logs.columns:
+                    season_stats[stat] = logs[stat].sum()
+                else:
+                    season_stats[stat] = 0
+            
+            # Calculate advanced stats
+            if season_stats['innings_pitched'] > 0:
+                # ERA
+                if 'earnedRuns' in logs.columns:
+                    season_stats['era'] = (season_stats['earnedRuns'] / season_stats['innings_pitched']) * 9
+                
+                # WHIP
+                if 'hits' in logs.columns and 'baseOnBalls' in logs.columns:
+                    season_stats['whip'] = (season_stats['hits'] + season_stats['baseOnBalls']) / season_stats['innings_pitched']
+                
+                # K/9, BB/9, HR/9
+                if 'strikeOuts' in logs.columns:
+                    season_stats['k9'] = (season_stats['strikeOuts'] / season_stats['innings_pitched']) * 9
+                
+                if 'baseOnBalls' in logs.columns:
+                    season_stats['bb9'] = (season_stats['baseOnBalls'] / season_stats['innings_pitched']) * 9
+                
+                if 'homeRuns' in logs.columns:
+                    season_stats['hr9'] = (season_stats['homeRuns'] / season_stats['innings_pitched']) * 9
+                
+                # K/BB ratio
+                if 'strikeOuts' in logs.columns and 'baseOnBalls' in logs.columns and season_stats['baseOnBalls'] > 0:
+                    season_stats['kbb'] = season_stats['strikeOuts'] / season_stats['baseOnBalls']
+            
+            # Game Score metrics
+            if 'gameScore' in logs.columns:
+                season_stats['avg_gamescore'] = logs['gameScore'].mean()
+                season_stats['max_gamescore'] = logs['gameScore'].max()
+                season_stats['min_gamescore'] = logs['gameScore'].min()
+                
+                # Stats for good and bad outings
+                good_games = logs[logs['performance'] == 'good']
+                bad_games = logs[logs['performance'] == 'bad']
+                
+                season_stats['good_games'] = len(good_games)
+                season_stats['bad_games'] = len(bad_games)
+                season_stats['good_game_pct'] = (len(good_games) / len(logs)) * 100 if len(logs) > 0 else 0
+            
+            stats[season] = season_stats
+        
+        self.season_stats = stats
+        return stats
+    
+    def fetch_pitch_data(self):
+        """Fetch real pitch data from Statcast for all games in both seasons"""
+        if not hasattr(self, 'combined_game_logs') or self.combined_game_logs.empty:
+            print("No game logs available. Cannot fetch pitch data.")
+            return None
+            
+        print("Fetching pitch data from Statcast...")
+        
+        try:
+            # Get dates for both seasons
+            season1_start = f"{self.season1}-03-01"
+            season1_end = f"{self.season1}-11-30"
+            season2_start = f"{self.season2}-03-01"
+            season2_end = f"{self.season2}-11-30"
+            
+            # Fetch pitch data for both seasons
+            print(f"Fetching pitch data for {self.season1}...")
+            pitcher_data1 = statcast_pitcher(season1_start, season1_end, self.mlbam_id)
+            
+            print(f"Fetching pitch data for {self.season2}...")
+            pitcher_data2 = statcast_pitcher(season2_start, season2_end, self.mlbam_id)
+            
+            # Combine data
+            if pitcher_data1.empty and pitcher_data2.empty:
+                print("No Statcast pitch data found for this pitcher.")
+                return None
+                
+            elif pitcher_data1.empty:
+                print(f"No pitch data found for {self.season1}.")
+                combined_data = pitcher_data2
+            elif pitcher_data2.empty:
+                print(f"No pitch data found for {self.season2}.")
+                combined_data = pitcher_data1
+            else:
+                combined_data = pd.concat([pitcher_data1, pitcher_data2])
+            
+            # Add season column based on game_date
+            combined_data['season'] = combined_data['game_date'].apply(
+                lambda x: self.season1 if pd.to_datetime(x).year == self.season1 else self.season2
+            )
+            
+            # Filter to only include games in our game logs
+            game_ids = self.combined_game_logs['game_id'].unique()
+            self.pitch_data = combined_data[combined_data['game_pk'].isin(game_ids)]
+            
+            # Clean up column names to match our analysis methods
+            self.pitch_data = self.pitch_data.rename(columns={
+                'pitch_type': 'pitch_type',
+                'release_speed': 'velocity',
+                'plate_x': 'location_x',
+                'plate_z': 'location_z',
+                'balls': 'balls',
+                'strikes': 'strikes',
+                'game_pk': 'game_id'
+            })
+            
+            # Create count column
+            self.pitch_data['count'] = self.pitch_data['balls'].astype(str) + '-' + self.pitch_data['strikes'].astype(str)
+            
+            # Filter out rows with missing essential data
+            self.pitch_data = self.pitch_data.dropna(subset=['pitch_type', 'velocity', 'location_x', 'location_z'])
+            
+            print(f"Successfully fetched {len(self.pitch_data)} pitches across {self.pitch_data['game_id'].nunique()} games")
+            return self.pitch_data
+            
+        except Exception as e:
+            print(f"Error fetching pitch data: {e}")
+            return None
+    
+    def analyze_pitch_mix(self):
+        """Analyze pitch mix in season1 vs season2"""
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for analysis")
+            return None
+            
+        # Get pitches for each season
+        season1_pitches = self.pitch_data[self.pitch_data['season'] == self.season1]
+        season2_pitches = self.pitch_data[self.pitch_data['season'] == self.season2]
+        
+        # Ensure we have data for both seasons
+        if season1_pitches.empty or season2_pitches.empty:
+            print("Insufficient data for pitch mix analysis")
+            return None
+            
+        season1_mix = season1_pitches['pitch_type'].value_counts(normalize=True) * 100
+        season2_mix = season2_pitches['pitch_type'].value_counts(normalize=True) * 100
+        
+        self.analysis_results['pitch_mix'] = {
+            'season1': season1_mix.to_dict(),
+            'season2': season2_mix.to_dict()
+        }
+        
+        # Print some summary info
+        print("\nPitch Mix Analysis:")
+        print(f"\n{self.season1} Season:")
+        for pitch, pct in sorted(season1_mix.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {pitch}: {pct:.1f}%")
+            
+        print(f"\n{self.season2} Season:")
+        for pitch, pct in sorted(season2_mix.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {pitch}: {pct:.1f}%")
+            
+        return self.analysis_results['pitch_mix']
+    
+    def analyze_velocity(self):
+        """Analyze velocity by pitch type in season1 vs season2"""
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for analysis")
+            return None
+            
+        # Get pitches for each season
+        season1_pitches = self.pitch_data[self.pitch_data['season'] == self.season1]
+        season2_pitches = self.pitch_data[self.pitch_data['season'] == self.season2]
+        
+        # Ensure we have data for both seasons
+        if season1_pitches.empty or season2_pitches.empty:
+            print("Insufficient data for velocity analysis")
+            return None
+            
+        # Group by pitch type and get mean velocity
+        season1_velo = season1_pitches.groupby('pitch_type')['velocity'].mean()
+        season2_velo = season2_pitches.groupby('pitch_type')['velocity'].mean()
+        
+        self.analysis_results['velocity'] = {
+            'season1': season1_velo.to_dict(),
+            'season2': season2_velo.to_dict()
+        }
+        
+        # Print some summary info
+        print("\nVelocity Analysis:")
+        print(f"\n{self.season1} Season:")
+        for pitch, velo in sorted(season1_velo.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {pitch}: {velo:.1f} mph")
+            
+        print(f"\n{self.season2} Season:")
+        for pitch, velo in sorted(season2_velo.items(), key=lambda x: x[1], reverse=True):
+            print(f"  {pitch}: {velo:.1f} mph")
+            
+        return self.analysis_results['velocity']
+    
+    def analyze_location(self):
+        """Analyze pitch location differences between seasons"""
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for analysis")
+            return None
+            
+        # Calculate average distance from center of strike zone
+        self.pitch_data['distance_from_center'] = np.sqrt(
+            self.pitch_data['location_x']**2 + 
+            (self.pitch_data['location_z'] - 2.5)**2
+        )
+        
+        # Get average distance by pitch type and season
+        location_data = {}
+        
+        for season in [self.season1, self.season2]:
+            season_data = self.pitch_data[self.pitch_data['season'] == season]
+            
+            if season_data.empty:
+                print(f"No data for {season} season in location analysis")
+                continue
+                
+            # Overall average distance
+            location_data[f'season{season}_overall'] = season_data['distance_from_center'].mean()
+            
+            # By pitch type
+            by_pitch = season_data.groupby('pitch_type')['distance_from_center'].mean()
+            location_data[f'season{season}_by_pitch'] = by_pitch.to_dict()
+            
+        self.analysis_results['location'] = location_data
+        
+        # Print some summary info
+        print("\nLocation Analysis:")
+        if f'season{self.season1}_overall' in location_data and f'season{self.season2}_overall' in location_data:
+            print(f"  {self.season1} season average distance from center: {location_data[f'season{self.season1}_overall']:.2f}")
+            print(f"  {self.season2} season average distance from center: {location_data[f'season{self.season2}_overall']:.2f}")
+            
+        return location_data
+    
+    def analyze_count_leverage(self):
+        """Analyze performance by count situation between seasons"""
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for analysis")
+            return None
+            
+        # Define count leverage (hitter vs pitcher counts)
+        hitter_counts = ['2-0', '3-0', '3-1', '2-1']
+        pitcher_counts = ['0-1', '0-2', '1-2', '2-2']
+        neutral_counts = ['0-0', '1-0', '1-1', '3-2']
+        
+    def analyze_performance_categories(self):
+        """Analyze differences between good and bad outings across seasons"""
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for performance category analysis")
+            return None
+            
+        performance_analysis = {}
+        
+        # Get pitches for each performance category in each season
+        s1_good_pitches = self.pitch_data[(self.pitch_data['season'] == self.season1) & 
+                                         (self.pitch_data['game_id'].isin(self.good_outings1['game_id']))]
+        s1_bad_pitches = self.pitch_data[(self.pitch_data['season'] == self.season1) & 
+                                        (self.pitch_data['game_id'].isin(self.bad_outings1['game_id']))]
+        s2_good_pitches = self.pitch_data[(self.pitch_data['season'] == self.season2) & 
+                                         (self.pitch_data['game_id'].isin(self.good_outings2['game_id']))]
+        s2_bad_pitches = self.pitch_data[(self.pitch_data['season'] == self.season2) & 
+                                        (self.pitch_data['game_id'].isin(self.bad_outings2['game_id']))]
+        
+        # Analyze pitch mix for each category
+        pitch_mix = {}
+        
+        for name, data in [
+            ('season1_good', s1_good_pitches), 
+            ('season1_bad', s1_bad_pitches),
+            ('season2_good', s2_good_pitches), 
+            ('season2_bad', s2_bad_pitches)
+        ]:
+            if not data.empty:
+                pitch_mix[name] = data['pitch_type'].value_counts(normalize=True) * 100
+            else:
+                pitch_mix[name] = pd.Series()
+                
+        performance_analysis['pitch_mix'] = pitch_mix
+        
+        # Analyze velocity for each category
+        velocity = {}
+        
+        for name, data in [
+            ('season1_good', s1_good_pitches), 
+            ('season1_bad', s1_bad_pitches),
+            ('season2_good', s2_good_pitches), 
+            ('season2_bad', s2_bad_pitches)
+        ]:
+            if not data.empty:
+                velocity[name] = data.groupby('pitch_type')['velocity'].mean().to_dict()
+            else:
+                velocity[name] = {}
+                
+        performance_analysis['velocity'] = velocity
+        
+        # Analyze location for each category
+        location = {}
+        
+        for name, data in [
+            ('season1_good', s1_good_pitches), 
+            ('season1_bad', s1_bad_pitches),
+            ('season2_good', s2_good_pitches), 
+            ('season2_bad', s2_bad_pitches)
+        ]:
+            if not data.empty:
+                # Calculate distance from center of strike zone
+                data_with_distance = data.copy()
+                data_with_distance['distance_from_center'] = np.sqrt(
+                    data_with_distance['location_x']**2 + 
+                    (data_with_distance['location_z'] - 2.5)**2
+                )
+                
+                # Overall average distance
+                location[f'{name}_overall'] = data_with_distance['distance_from_center'].mean()
+                
+                # By pitch type
+                by_pitch = data_with_distance.groupby('pitch_type')['distance_from_center'].mean()
+                location[f'{name}_by_pitch'] = by_pitch.to_dict()
+        
+        performance_analysis['location'] = location
+        
+        self.analysis_results['performance_categories'] = performance_analysis
+        
+        # Print summary
+        print("\nPerformance Category Analysis:")
+        for category in ['Good', 'Bad']:
+            category_lower = category.lower()
+            print(f"\n{category} Outings Comparison:")
+            
+            # Pitch Mix
+            if (f'season1_{category_lower}' in pitch_mix and 
+                f'season2_{category_lower}' in pitch_mix and
+                not pitch_mix[f'season1_{category_lower}'].empty and
+                not pitch_mix[f'season2_{category_lower}'].empty):
+                
+                s1_mix = pitch_mix[f'season1_{category_lower}']
+                s2_mix = pitch_mix[f'season2_{category_lower}']
+                
+                common_pitches = set(s1_mix.index) & set(s2_mix.index)
+                if common_pitches:
+                    print(f"  Pitch Mix Changes in {category} Outings:")
+                    for pitch in common_pitches:
+                        diff = s2_mix[pitch] - s1_mix[pitch]
+                        if abs(diff) >= 3:  # Only show significant changes
+                            change = "increased" if diff > 0 else "decreased"
+                            print(f"    {pitch} usage {change} by {abs(diff):.1f}% in {category.lower()} outings")
+        
+        return performance_analysis
+        
+        self.pitch_data['count_leverage'] = 'neutral'
+        self.pitch_data.loc[self.pitch_data['count'].isin(hitter_counts), 'count_leverage'] = 'hitter'
+        self.pitch_data.loc[self.pitch_data['count'].isin(pitcher_counts), 'count_leverage'] = 'pitcher'
+        
+        # Analyze pitch selection by count leverage
+        count_analysis = {}
+        
+        for season in [self.season1, self.season2]:
+            season_data = self.pitch_data[self.pitch_data['season'] == season]
+            
+            if season_data.empty:
+                print(f"No data for {season} season in count leverage analysis")
+                continue
+                
+            # Pitch mix by count leverage
+            pitch_mix_by_leverage = {}
+            for leverage in ['hitter', 'neutral', 'pitcher']:
+                leverage_data = season_data[season_data['count_leverage'] == leverage]
+                if len(leverage_data) > 0:
+                    pitch_mix = leverage_data['pitch_type'].value_counts(normalize=True) * 100
+                    pitch_mix_by_leverage[leverage] = pitch_mix.to_dict()
+                else:
+                    pitch_mix_by_leverage[leverage] = {}
+                
+            count_analysis[f'season{season}'] = pitch_mix_by_leverage
+            
+        self.analysis_results['count_leverage'] = count_analysis
+        
+        # Print summary info
+        print("\nCount Leverage Analysis:")
+        for season in [self.season1, self.season2]:
+            if f'season{season}' in count_analysis:
+                print(f"\n{season} Season:")
+                for leverage, mix in count_analysis[f'season{season}'].items():
+                    print(f"  {leverage.capitalize()} counts:")
+                    for pitch, pct in sorted(mix.items(), key=lambda x: x[1], reverse=True)[:3]:  # Top 3 pitches
+                        print(f"    {pitch}: {pct:.1f}%")
+                        
+        return count_analysis
+    
+    def generate_insights(self):
+        """Generate narrative insights based on year-to-year analysis"""
+        if not self.analysis_results:
+            print("No analysis results available for insights")
+            return []
+            
+        insights = []
+        
+        # Pitch mix insights
+        if 'pitch_mix' in self.analysis_results:
+            season1_mix = self.analysis_results['pitch_mix']['season1']
+            season2_mix = self.analysis_results['pitch_mix']['season2']
+            
+            # Find significant differences
+            for pitch in set(season1_mix.keys()) | set(season2_mix.keys()):
+                season1_pct = season1_mix.get(pitch, 0)
+                season2_pct = season2_mix.get(pitch, 0)
+                diff = season2_pct - season1_pct
+                
+                if abs(diff) >= 5:  # 5% threshold
+                    if diff > 0:
+                        insights.append(f"Increased {pitch} usage by {diff:.1f}% from {self.season1} to {self.season2}")
+                    else:
+                        insights.append(f"Decreased {pitch} usage by {abs(diff):.1f}% from {self.season1} to {self.season2}")
+        
+        # Velocity insights
+        if 'velocity' in self.analysis_results:
+            season1_velo = self.analysis_results['velocity']['season1']
+            season2_velo = self.analysis_results['velocity']['season2']
+            
+            for pitch in set(season1_velo.keys()) | set(season2_velo.keys()):
+                if pitch in season1_velo and pitch in season2_velo:
+                    diff = season2_velo[pitch] - season1_velo[pitch]
+                    
+                    if abs(diff) >= 1.0:  # 1 mph threshold
+                        if diff > 0:
+                            insights.append(f"{pitch} velocity increased by {diff:.1f} mph from {self.season1} to {self.season2}")
+                        else:
+                            insights.append(f"{pitch} velocity decreased by {abs(diff):.1f} mph from {self.season1} to {self.season2}")
+        
+        # Location insights
+        if 'location' in self.analysis_results:
+            loc_data = self.analysis_results['location']
+            
+            # Overall command
+            season1_loc = loc_data.get(f'season{self.season1}_overall', 0)
+            season2_loc = loc_data.get(f'season{self.season2}_overall', 0)
+            
+            if season1_loc and season2_loc:
+                diff = season2_loc - season1_loc
+                if abs(diff) >= 0.1:
+                    if diff < 0:  # Smaller distance is better command
+                        insights.append(f"Showed improved overall command in {self.season2} vs {self.season1}")
+                    else:
+                        insights.append(f"Pitched more to edges in {self.season2} vs {self.season1}")
+                        
+            # By pitch type
+            season1_by_pitch = loc_data.get(f'season{self.season1}_by_pitch', {})
+            season2_by_pitch = loc_data.get(f'season{self.season2}_by_pitch', {})
+            
+            for pitch in set(season1_by_pitch.keys()) | set(season2_by_pitch.keys()):
+                if pitch in season1_by_pitch and pitch in season2_by_pitch:
+                    diff = season2_by_pitch[pitch] - season1_by_pitch[pitch]
+                    
+                    if abs(diff) >= 0.2:  # Threshold for significance
+                        if diff < 0:
+                            insights.append(f"Showed better {pitch} command in {self.season2} vs {self.season1}")
+                        else:
+                            insights.append(f"Located {pitch} more to edges in {self.season2} vs {self.season1}")
+        
+        # Count leverage insights
+        if 'count_leverage' in self.analysis_results:
+            count_data = self.analysis_results['count_leverage']
+            
+            season1_counts = count_data.get(f'season{self.season1}', {})
+            season2_counts = count_data.get(f'season{self.season2}', {})
+            
+            # Check hitter counts
+            if 'hitter' in season1_counts and 'hitter' in season2_counts:
+                season1_hitter = season1_counts['hitter']
+                season2_hitter = season2_counts['hitter']
+                
+                for pitch in set(season1_hitter.keys()) | set(season2_hitter.keys()):
+                    season1_pct = season1_hitter.get(pitch, 0)
+                    season2_pct = season2_hitter.get(pitch, 0)
+                    diff = season2_pct - season1_pct
+                    
+                    if abs(diff) >= 10:  # Higher threshold for count-specific analysis
+                        if diff > 0:
+                            insights.append(f"Used {pitch} {diff:.1f}% more often in hitter's counts in {self.season2} vs {self.season1}")
+                        else:
+                            insights.append(f"Used {pitch} {abs(diff):.1f}% less often in hitter's counts in {self.season2} vs {self.season1}")
+        
+        # Season stats insights from calculated stats
+        if self.season_stats and self.season1 in self.season_stats and self.season2 in self.season_stats:
+            s1_stats = self.season_stats[self.season1]
+            s2_stats = self.season_stats[self.season2]
+            
+            if s1_stats and s2_stats:
+                # ERA
+                if 'era' in s1_stats and 'era' in s2_stats:
+                    era_diff = s2_stats['era'] - s1_stats['era']
+                    if abs(era_diff) >= 0.5:
+                        if era_diff < 0:
+                            insights.append(f"ERA improved from {s1_stats['era']:.2f} to {s2_stats['era']:.2f} ({abs(era_diff):.2f} decrease)")
+                        else:
+                            insights.append(f"ERA increased from {s1_stats['era']:.2f} to {s2_stats['era']:.2f} ({era_diff:.2f} increase)")
+                
+                # WHIP
+                if 'whip' in s1_stats and 'whip' in s2_stats:
+                    whip_diff = s2_stats['whip'] - s1_stats['whip']
+                    if abs(whip_diff) >= 0.1:
+                        if whip_diff < 0:
+                            insights.append(f"WHIP improved from {s1_stats['whip']:.2f} to {s2_stats['whip']:.2f} ({abs(whip_diff):.2f} decrease)")
+                        else:
+                            insights.append(f"WHIP increased from {s1_stats['whip']:.2f} to {s2_stats['whip']:.2f} ({whip_diff:.2f} increase)")
+                
+                # K/9
+                if 'k9' in s1_stats and 'k9' in s2_stats:
+                    k9_diff = s2_stats['k9'] - s1_stats['k9']
+                    if abs(k9_diff) >= 0.5:
+                        if k9_diff > 0:
+                            insights.append(f"Strikeout rate increased from {s1_stats['k9']:.2f} to {s2_stats['k9']:.2f} K/9 ({k9_diff:.2f} increase)")
+                        else:
+                            insights.append(f"Strikeout rate decreased from {s1_stats['k9']:.2f} to {s2_stats['k9']:.2f} K/9 ({abs(k9_diff):.2f} decrease)")
+                
+                # Good games percentage
+                if 'good_game_pct' in s1_stats and 'good_game_pct' in s2_stats:
+                    good_diff = s2_stats['good_game_pct'] - s1_stats['good_game_pct']
+                    if abs(good_diff) >= 10:
+                        if good_diff > 0:
+                            insights.append(f"Percentage of good outings (Game Score ≥ {self.good_threshold}) increased from {s1_stats['good_game_pct']:.1f}% to {s2_stats['good_game_pct']:.1f}% ({good_diff:.1f}% increase)")
+                        else:
+                            insights.append(f"Percentage of good outings (Game Score ≥ {self.good_threshold}) decreased from {s1_stats['good_game_pct']:.1f}% to {s2_stats['good_game_pct']:.1f}% ({abs(good_diff):.1f}% decrease)")
+        
+        # Performance category insights
+        if 'performance_categories' in self.analysis_results:
+            perf_data = self.analysis_results['performance_categories']
+            
+            # Check for differences in good outings between seasons
+            if 'pitch_mix' in perf_data:
+                mix_data = perf_data['pitch_mix']
+                
+                # Good outings pitch mix comparison
+                if 'season1_good' in mix_data and 'season2_good' in mix_data:
+                    s1_good = mix_data['season1_good']
+                    s2_good = mix_data['season2_good']
+                    
+                    if not s1_good.empty and not s2_good.empty:
+                        for pitch in set(s1_good.index) & set(s2_good.index):
+                            diff = s2_good[pitch] - s1_good[pitch]
+                            if abs(diff) >= 8:  # Higher threshold for performance category
+                                if diff > 0:
+                                    insights.append(f"In good outings, {pitch} usage increased by {diff:.1f}% from {self.season1} to {self.season2}")
+                                else:
+                                    insights.append(f"In good outings, {pitch} usage decreased by {abs(diff):.1f}% from {self.season1} to {self.season2}")
+                
+                # Bad outings pitch mix comparison
+                if 'season1_bad' in mix_data and 'season2_bad' in mix_data:
+                    s1_bad = mix_data['season1_bad']
+                    s2_bad = mix_data['season2_bad']
+                    
+                    if not s1_bad.empty and not s2_bad.empty:
+                        for pitch in set(s1_bad.index) & set(s2_bad.index):
+                            diff = s2_bad[pitch] - s1_bad[pitch]
+                            if abs(diff) >= 8:  # Higher threshold for performance category
+                                if diff > 0:
+                                    insights.append(f"In bad outings, {pitch} usage increased by {diff:.1f}% from {self.season1} to {self.season2}")
+                                else:
+                                    insights.append(f"In bad outings, {pitch} usage decreased by {abs(diff):.1f}% from {self.season1} to {self.season2}")
+            
+            # Check for velocity differences in good/bad outings
+            if 'velocity' in perf_data:
+                velo_data = perf_data['velocity']
+                
+                # Compare good outings velocity
+                if 'season1_good' in velo_data and 'season2_good' in velo_data:
+                    s1_good = velo_data['season1_good']
+                    s2_good = velo_data['season2_good']
+                    
+                    for pitch in set(s1_good.keys()) & set(s2_good.keys()):
+                        diff = s2_good[pitch] - s1_good[pitch]
+                        if abs(diff) >= 1.5:  # Higher threshold for subcategory
+                            if diff > 0:
+                                insights.append(f"In good outings, {pitch} velocity increased by {diff:.1f} mph from {self.season1} to {self.season2}")
+                            else:
+                                insights.append(f"In good outings, {pitch} velocity decreased by {abs(diff):.1f} mph from {self.season1} to {self.season2}")
+        
+        # Game performance insights
+        if hasattr(self, 'game_logs1') and hasattr(self, 'game_logs2'):
+            # Calculate basic season stats
+            def calc_season_stats(df):
+                if df.empty:
+                    return {}
+                stats = {}
+                for metric in ['ip_numeric', 'strikeOuts', 'baseOnBalls', 'hits', 'homeRuns', 'gameScore']:
+                    if metric in df.columns:
+                        stats[metric] = df[metric].mean()
+                return stats
+            
+            season1_stats = calc_season_stats(self.game_logs1)
+            season2_stats = calc_season_stats(self.game_logs2)
+            
+            # Compare key metrics
+            for metric in season1_stats.keys() & season2_stats.keys():
+                diff = season2_stats[metric] - season1_stats[metric]
+                
+                # Customize the threshold and message based on the metric
+                if metric == 'gameScore' and abs(diff) >= 5:
+                    if diff > 0:
+                        insights.append(f"Game Score improved by {diff:.1f} points from {self.season1} to {self.season2}")
+                    else:
+                        insights.append(f"Game Score declined by {abs(diff):.1f} points from {self.season1} to {self.season2}")
+                        
+                elif metric == 'ip_numeric' and abs(diff) >= 0.5:
+                    if diff > 0:
+                        insights.append(f"Pitched {diff:.1f} more innings per start on average in {self.season2}")
+                    else:
+                        insights.append(f"Pitched {abs(diff):.1f} fewer innings per start on average in {self.season2}")
+                        
+                elif metric == 'strikeOuts' and abs(diff) >= 1:
+                    if diff > 0:
+                        insights.append(f"Strikeouts per game increased by {diff:.1f} from {self.season1} to {self.season2}")
+                    else:
+                        insights.append(f"Strikeouts per game decreased by {abs(diff):.1f} from {self.season1} to {self.season2}")
+        
+        return insights
+    
+    def plot_pitch_mix_comparison(self):
+        """Plot pitch mix comparison between seasons"""
+        if 'pitch_mix' not in self.analysis_results:
+            print("No pitch mix data available for plotting")
+            return None
+            
+        season1_mix = self.analysis_results['pitch_mix']['season1']
+        season2_mix = self.analysis_results['pitch_mix']['season2']
+        
+        # Check if we have data to plot
+        if not season1_mix or not season2_mix:
+            print("Insufficient data for pitch mix comparison")
+            return None
+            
+        # Set up the figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+        
+        # Plot season1
+        if season1_mix:
+            ax1.pie(season1_mix.values(), labels=season1_mix.keys(), autopct='%1.1f%%')
+            ax1.set_title(f'Pitch Mix - {self.season1} Season')
+        else:
+            ax1.text(0.5, 0.5, f'No data for {self.season1}', ha='center', va='center')
+            ax1.set_title(f'Pitch Mix - {self.season1} Season (No Data)')
+            
+        # Plot season2
+        if season2_mix:
+            ax2.pie(season2_mix.values(), labels=season2_mix.keys(), autopct='%1.1f%%')
+            ax2.set_title(f'Pitch Mix - {self.season2} Season')
+        else:
+            ax2.text(0.5, 0.5, f'No data for {self.season2}', ha='center', va='center')
+            ax2.set_title(f'Pitch Mix - {self.season2} Season (No Data)')
+            
+        plt.tight_layout()
+        return fig
+    
+    def plot_velocity_comparison(self):
+        """Plot velocity comparison between seasons"""
+        if 'velocity' not in self.analysis_results:
+            print("No velocity data available for plotting")
+            return None
+            
+        season1_velo = self.analysis_results['velocity']['season1']
+        season2_velo = self.analysis_results['velocity']['season2']
+        
+        # Get all pitch types
+        pitch_types = sorted(set(season1_velo.keys()) | set(season2_velo.keys()))
+        
+        # Prepare data
+        season1_values = [season1_velo.get(pitch, 0) for pitch in pitch_types]
+        season2_values = [season2_velo.get(pitch, 0) for pitch in pitch_types]
+        
+        # Set up the figure
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        # Set width of bars
+        bar_width = 0.35
+        index = np.arange(len(pitch_types))
+        
+        # Plot bars
+        ax.bar(index - bar_width/2, season1_values, bar_width, label=f'{self.season1} Season')
+        ax.bar(index + bar_width/2, season2_values, bar_width, label=f'{self.season2} Season')
+        
+        # Add labels and title
+        ax.set_xlabel('Pitch Type')
+        ax.set_ylabel('Velocity (mph)')
+        ax.set_title('Pitch Velocity Comparison')
+        ax.set_xticks(index)
+        ax.set_xticklabels(pitch_types)
+        ax.legend()
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_location_heatmap(self, season, pitch_type=None):
+        """Plot location heatmap for specific season and pitch type"""
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for plotting")
+            return None
+            
+        # Filter data
+        mask = self.pitch_data['season'] == season
+        if pitch_type:
+            mask &= self.pitch_data['pitch_type'] == pitch_type
+            
+        data = self.pitch_data[mask]
+        
+        if len(data) < 30:  # Minimum sample size for meaningful visualization
+            print(f"Insufficient data for {season} season and pitch type {pitch_type}")
+            return None
+            
+        # Create strike zone
+        zone_width = 1.7  # Approx strike zone width (ft)
+        zone_height = 2.0  # Approx strike zone height (ft)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(8, 8))
+        
+        # Plot scatter of pitches
+        sns.kdeplot(
+            x=data['location_x'], 
+            y=data['location_z'],
+            cmap='Blues',
+            fill=True,
+            ax=ax
+        )
+        
+        # Draw strike zone
+        zone_left = -zone_width/2
+        zone_right = zone_width/2
+        zone_bottom = 1.5  # Approx strike zone bottom (ft)
+        zone_top = zone_bottom + zone_height
+        
+        ax.plot([zone_left, zone_right, zone_right, zone_left, zone_left],
+                [zone_bottom, zone_bottom, zone_top, zone_top, zone_bottom],
+                'k-', lw=2)
+        
+        # Set plot properties
+        title = f"Pitch Location - {season} Season"
+        if pitch_type:
+            title += f" ({pitch_type})"
+            
+        ax.set_title(title)
+        ax.set_xlim(-3, 3)
+        ax.set_ylim(0, 5)
+        ax.set_xlabel('Horizontal Location (ft)')
+        ax.set_ylabel('Vertical Location (ft)')
+        
+        plt.tight_layout()
+        return fig
+    
+    def plot_season_performance_comparison(self):
+        """Plot overall performance metrics comparison between seasons"""
+        if not hasattr(self, 'game_logs1') or not hasattr(self, 'game_logs2'):
+            print("No game logs available for plotting")
+            return None
+            
+        if self.game_logs1.empty or self.game_logs2.empty:
+            print("Insufficient game log data for comparison")
+            return None
+            
+        # Collect metrics to compare
+        metrics = ['ip_numeric', 'strikeOuts', 'baseOnBalls', 'hits', 'homeRuns', 'gameScore']
+        available_metrics = [m for m in metrics if m in self.game_logs1.columns and m in self.game_logs2.columns]
+        
+        if not available_metrics:
+            print("No common metrics available for comparison")
+            return None
+            
+    def get_mlb_api_season_data(self, season):
+        """Get season data directly from MLB.com API"""
+        try:
+            print(f"Fetching MLB.com API data for {self.pitcher['fullName']} for {season}...")
+            # Base URL for MLB Stats API
+            url = f"https://statsapi.mlb.com/api/v1/people/{self.mlbam_id}/stats?stats=season&season={season}&group=pitching"
+            
+            response = requests.get(url)
+            if response.status_code != 200:
+                print(f"Error: MLB.com API returned status code {response.status_code}")
+                return None
+                
+            data = response.json()
+            
+            # Check if we have data
+            if 'stats' not in data or not data['stats'] or 'splits' not in data['stats'][0]:
+                print(f"No MLB.com API data found for {season}")
+                return None
+                
+            # Get the season stats
+            season_stats = data['stats'][0]['splits']
+            if not season_stats:
+                print(f"No split data found for {season}")
+                return None
+                
+            # Create a simple DataFrame from the season stats
+            # This is a single-row summary of the season
+            stat_data = season_stats[0]['stat']
+            
+            game_log_data = [{
+                'game_id': 0,  # placeholder
+                'date': f"{season}-07-01",  # middle of season placeholder
+                'game_date': pd.to_datetime(f"{season}-07-01"),
+                'opponent': 'Season Summary',
+                'games': stat_data.get('gamesPlayed', 0),
+                'gamesStarted': stat_data.get('gamesStarted', 0),
+                'ip_numeric': stat_data.get('inningsPitched', 0),
+                'inningsPitched': str(stat_data.get('inningsPitched', 0)),
+                'hits': stat_data.get('hits', 0),
+                'runs': stat_data.get('runs', 0),
+                'earnedRuns': stat_data.get('earnedRuns', 0),
+                'baseOnBalls': stat_data.get('baseOnBalls', 0),
+                'strikeOuts': stat_data.get('strikeOuts', 0),
+                'homeRuns': stat_data.get('homeRuns', 0),
+                'era': stat_data.get('era', 0),
+                'avg': stat_data.get('avg', 0),
+                'whip': stat_data.get('whip', 0),
+                'wins': stat_data.get('wins', 0),
+                'losses': stat_data.get('losses', 0),
+                'saves': stat_data.get('saves', 0),
+                'season': season
+            }]
+            
+            # Create a DataFrame
+            season_df = pd.DataFrame(game_log_data)
+            
+            # Convert numeric columns
+            for col in season_df.columns:
+                if col not in ['date', 'game_date', 'opponent', 'inningsPitched', 'season']:
+                    season_df[col] = pd.to_numeric(season_df[col], errors='coerce')
+            
+            # Add a flag to indicate this is a summary dataset
+            season_df['is_summary'] = True
+            
+            # Add a placeholder game score
+            if 'era' in season_df.columns and 'whip' in season_df.columns:
+                # Roughly approximate average game score based on ERA and WHIP
+                era = season_df['era'].iloc[0]
+                whip = season_df['whip'].iloc[0]
+                
+                # A very rough approximation - real game scores would vary per game
+                avg_game_score = 50 + (5.0 - era) * 5 - (whip - 1.0) * 10
+                season_df['gameScore'] = avg_game_score
+            else:
+                season_df['gameScore'] = 50  # default neutral score
+            
+            print(f"Successfully created season summary data for {season}")
+            return season_df
+            
+        except Exception as e:
+            print(f"Error fetching MLB.com API data: {e}")
+            return None
+
+    def plot_performance_categories(self):
+        """Plot good vs. bad outings comparison between seasons"""
+        if not hasattr(self, 'good_outings1') or not hasattr(self, 'good_outings2'):
+            print("No performance classification data available")
+            return None
+        
+        # Create figure
+        fig, axes = plt.subplots(2, 1, figsize=(10, 12))
+        
+        # Plot 1: Percentage of good/bad outings by season
+        ax1 = axes[0]
+        
+        # Calculate percentages
+        s1_total = len(self.game_logs1)
+        s2_total = len(self.game_logs2)
+        
+        s1_good_pct = (len(self.good_outings1) / s1_total * 100) if s1_total > 0 else 0
+        s1_bad_pct = (len(self.bad_outings1) / s1_total * 100) if s1_total > 0 else 0
+        s1_avg_pct = 100 - s1_good_pct - s1_bad_pct
+        
+        s2_good_pct = (len(self.good_outings2) / s2_total * 100) if s2_total > 0 else 0
+        s2_bad_pct = (len(self.bad_outings2) / s2_total * 100) if s2_total > 0 else 0
+        s2_avg_pct = 100 - s2_good_pct - s2_bad_pct
+        
+        # Create data
+        categories = ['Good', 'Average', 'Bad']
+        s1_data = [s1_good_pct, s1_avg_pct, s1_bad_pct]
+        s2_data = [s2_good_pct, s2_avg_pct, s2_bad_pct]
+        
+        x = np.arange(len(categories))
+        width = 0.35
+        
+        ax1.bar(x - width/2, s1_data, width, label=f'{self.season1}')
+        ax1.bar(x + width/2, s2_data, width, label=f'{self.season2}')
+        
+        # Add labels and title
+        ax1.set_title(f'Outing Quality Distribution (Good: ≥{self.good_threshold}, Bad: ≤{self.bad_threshold})')
+        ax1.set_ylabel('Percentage of Games')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(categories)
+        ax1.legend()
+        
+        # Add value labels
+        for i, v in enumerate(s1_data):
+            ax1.text(i - width/2, v + 1, f"{v:.1f}%", ha='center')
+        for i, v in enumerate(s2_data):
+            ax1.text(i + width/2, v + 1, f"{v:.1f}%", ha='center')
+            
+        # Plot 2: Game Score distribution by season
+        ax2 = axes[1]
+        
+        if 'gameScore' in self.game_logs1.columns and 'gameScore' in self.game_logs2.columns:
+            # Create box plot
+            box_data = [
+                self.game_logs1['gameScore'],
+                self.game_logs2['gameScore']
+            ]
+            
+            ax2.boxplot(box_data, labels=[f'{self.season1}', f'{self.season2}'])
+            
+            # Add scatter plot overlay for actual game scores
+            for i, season_data in enumerate([self.game_logs1, self.game_logs2], 1):
+                y = season_data['gameScore']
+                # Add some jitter to x to see overlapping points
+                x = np.random.normal(i, 0.04, size=len(y))
+                ax2.scatter(x, y, alpha=0.5, s=25)
+            
+            # Add reference lines for thresholds
+            ax2.axhline(y=self.good_threshold, color='g', linestyle='--', alpha=0.5, label=f'Good Threshold ({self.good_threshold})')
+            ax2.axhline(y=self.bad_threshold, color='r', linestyle='--', alpha=0.5, label=f'Bad Threshold ({self.bad_threshold})')
+            
+            ax2.set_title('Game Score Distribution by Season')
+            ax2.set_ylabel('Game Score')
+            ax2.legend()
+        else:
+            ax2.text(0.5, 0.5, 'Game Score data not available', ha='center', va='center')
+            
+        plt.tight_layout()
+        return fig
+        
+        # Calculate averages for each metric
+        season1_stats = {}
+        season2_stats = {}
+        
+        for metric in available_metrics:
+            season1_stats[metric] = self.game_logs1[metric].mean()
+            season2_stats[metric] = self.game_logs2[metric].mean()
+            
+        # Set up the figure
+        fig, axes = plt.subplots(len(available_metrics), 1, figsize=(10, 3*len(available_metrics)))
+        
+        # Adjust for single metric case
+        if len(available_metrics) == 1:
+            axes = [axes]
+            
+        # Plot each metric
+        for i, metric in enumerate(available_metrics):
+            ax = axes[i]
+            
+            # Format metric name for display
+            metric_display = {
+                'ip_numeric': 'Innings Pitched',
+                'strikeOuts': 'Strikeouts',
+                'baseOnBalls': 'Walks',
+                'hits': 'Hits Allowed',
+                'homeRuns': 'Home Runs Allowed',
+                'gameScore': 'Game Score'
+            }.get(metric, metric)
+            
+            # Plot bars
+            seasons = [self.season1, self.season2]
+            values = [season1_stats[metric], season2_stats[metric]]
+            
+            ax.bar(seasons, values, color=['royalblue', 'coral'])
+            
+            # Add labels and value
+            for j, v in enumerate(values):
+                ax.text(j, v + 0.1, f"{v:.2f}", ha='center')
+                
+            ax.set_title(f'Average {metric_display} per Game')
+            ax.set_ylabel(metric_display)
+            
+        plt.tight_layout()
+        return fig
+    
+    def create_visualizations(self):
+        """Create visualization dashboard"""
+        visualizations = {}
+        
+        # Before creating visualizations, check if we have enough data
+        if not hasattr(self, 'combined_game_logs') or self.combined_game_logs.empty:
+            print("No game log data available for visualizations")
+            return visualizations
+            
+        season1_games = self.combined_game_logs[self.combined_game_logs['season'] == self.season1]
+        season2_games = self.combined_game_logs[self.combined_game_logs['season'] == self.season2]
+            
+        if season1_games.empty and season2_games.empty:
+            print(f"No games found for {self.season1} or {self.season2}")
+            return visualizations
+            
+        # Also check if we have pitch data
+        if self.pitch_data is None or self.pitch_data.empty:
+            print("No pitch data available for visualizations")
+            return visualizations
+            
+        # Count data points for each season
+        season1_pitches = self.pitch_data[self.pitch_data['season'] == self.season1]
+        season2_pitches = self.pitch_data[self.pitch_data['season'] == self.season2]
+        
+        print(f"Found {len(season1_pitches)} pitches for {self.season1} and {len(season2_pitches)} pitches for {self.season2}")
+        
+        # Check minimum requirements
+        if len(season1_pitches) < 30 and len(season2_pitches) < 30:
+            print("Insufficient pitch data for meaningful visualizations")
+            return visualizations
+        
+        # Pitch mix comparison
+        pitch_mix_fig = self.plot_pitch_mix_comparison()
+        if pitch_mix_fig is not None:
+            visualizations['pitch_mix'] = pitch_mix_fig
+        
+        # Velocity comparison
+        velocity_fig = self.plot_velocity_comparison()
+        if velocity_fig is not None:
+            visualizations['velocity'] = velocity_fig
+        
+        # Season performance comparison
+        performance_fig = self.plot_season_performance_comparison()
+        if performance_fig is not None:
+            visualizations['performance'] = performance_fig
+        
+        # Performance categories visualization
+        performance_cat_fig = self.plot_performance_categories()
+        if performance_cat_fig is not None:
+            visualizations['performance_categories'] = performance_cat_fig
+            
+        # Location heatmaps
+        if len(season1_pitches) >= 30:
+            location_season1_fig = self.plot_location_heatmap(self.season1)
+            if location_season1_fig is not None:
+                visualizations[f'location_{self.season1}'] = location_season1_fig
+                
+        if len(season2_pitches) >= 30:
+            location_season2_fig = self.plot_location_heatmap(self.season2)
+            if location_season2_fig is not None:
+                visualizations[f'location_{self.season2}'] = location_season2_fig
+        
+        # If we have pitch data with primary pitch types, show those too
+        if self.pitch_data is not None and not self.pitch_data.empty:
+            # Get top pitches (at least 10% usage)
+            pitch_counts = self.pitch_data['pitch_type'].value_counts(normalize=True)
+            top_pitches = pitch_counts[pitch_counts >= 0.1].index.tolist()
+            
+            for pitch in top_pitches:
+                season1_pitch_data = season1_pitches[season1_pitches['pitch_type'] == pitch]
+                season2_pitch_data = season2_pitches[season2_pitches['pitch_type'] == pitch]
+                
+                if len(season1_pitch_data) >= 30:
+                    season1_pitch_fig = self.plot_location_heatmap(self.season1, pitch)
+                    if season1_pitch_fig is not None:
+                        visualizations[f'location_{self.season1}_{pitch}'] = season1_pitch_fig
+                        
+                if len(season2_pitch_data) >= 30:
+                    season2_pitch_fig = self.plot_location_heatmap(self.season2, pitch)
+                    if season2_pitch_fig is not None:
+                        visualizations[f'location_{self.season2}_{pitch}'] = season2_pitch_fig
+        
+        return visualizations
+    
+    def generate_report(self):
+        """Generate comprehensive year-to-year comparison report"""
+        insights = self.generate_insights()
+
+        report = [
+            f"# {self.pitcher['fullName']} Year-to-Year Comparison ({self.season1} vs {self.season2})",
+            f"\n## Overview",
+            f"Comparison of {len(self.game_logs1) if hasattr(self, 'game_logs1') else 0} appearances in {self.season1} vs " +
+            f"{len(self.game_logs2) if hasattr(self, 'game_logs2') else 0} appearances in {self.season2}."
+        ]
+        
+        # Add performance summary
+        if hasattr(self, 'game_logs1') and hasattr(self, 'game_logs2') and 'gameScore' in self.game_logs1.columns and 'gameScore' in self.game_logs2.columns:
+            season1_avg = self.game_logs1['gameScore'].mean()
+            season2_avg = self.game_logs2['gameScore'].mean()
+            diff = season2_avg - season1_avg
+            
+            if diff > 0:
+                report.append(f"Overall performance improved from {self.season1} to {self.season2}, with average Game Score " +
+                             f"increasing from {season1_avg:.1f} to {season2_avg:.1f} (+{diff:.1f} points).")
+            elif diff < 0:
+                report.append(f"Overall performance declined from {self.season1} to {self.season2}, with average Game Score " +
+                             f"decreasing from {season1_avg:.1f} to {season2_avg:.1f} ({diff:.1f} points).")
+            else:
+                report.append(f"Overall performance remained consistent between seasons, with average Game Score " +
+                             f"of {season1_avg:.1f} in {self.season1} and {season2_avg:.1f} in {self.season2}.")
+        
+        # Add summary of good/bad outings comparison
+        if hasattr(self, 'good_outings1') and hasattr(self, 'good_outings2'):
+            good1_pct = (len(self.good_outings1) / len(self.game_logs1) * 100) if len(self.game_logs1) > 0 else 0
+            good2_pct = (len(self.good_outings2) / len(self.game_logs2) * 100) if len(self.game_logs2) > 0 else 0
+            bad1_pct = (len(self.bad_outings1) / len(self.game_logs1) * 100) if len(self.game_logs1) > 0 else 0
+            bad2_pct = (len(self.bad_outings2) / len(self.game_logs2) * 100) if len(self.game_logs2) > 0 else 0
+            
+            report.append(f"\nUsing Game Score thresholds: Good ≥ {self.good_threshold}, Bad ≤ {self.bad_threshold}")
+            report.append(f"- {self.season1}: {len(self.good_outings1)} good outings ({good1_pct:.1f}%), {len(self.bad_outings1)} bad outings ({bad1_pct:.1f}%)")
+            report.append(f"- {self.season2}: {len(self.good_outings2)} good outings ({good2_pct:.1f}%), {len(self.bad_outings2)} bad outings ({bad2_pct:.1f}%)")
+            
+        # Add season stats comparison
+        if self.season_stats and self.season1 in self.season_stats and self.season2 in self.season_stats:
+            s1_stats = self.season_stats[self.season1]
+            s2_stats = self.season_stats[self.season2]
+            
+            if s1_stats and s2_stats:
+                report.append(f"\n## Season Statistics")
+                
+                # Table header
+                report.append("| Statistic | " + 
+                             f"{self.season1} | " + 
+                             f"{self.season2} | Change |")
+                report.append("|-----------|-------|-------|--------|")
+                
+                # Selected stats to show
+                stat_display = {
+                    'games': 'Games',
+                    'innings_pitched': 'Innings Pitched',
+                    'strikeOuts': 'Strikeouts',
+                    'baseOnBalls': 'Walks',
+                    'hits': 'Hits Allowed',
+                    'homeRuns': 'Home Runs',
+                    'era': 'ERA',
+                    'whip': 'WHIP',
+                    'k9': 'K/9',
+                    'bb9': 'BB/9',
+                    'kbb': 'K/BB Ratio',
+                    'avg_gamescore': 'Avg Game Score',
+                    'good_game_pct': '% Good Games'
+                }
+                
+                # Add each stat to report if available
+                for stat, label in stat_display.items():
+                    if stat in s1_stats and stat in s2_stats:
+                        val1 = s1_stats[stat]
+                        val2 = s2_stats[stat]
+                        diff = val2 - val1
+                        
+                        # Format differently depending on stat
+                        if stat in ['era', 'whip', 'k9', 'bb9', 'kbb']:
+                            report.append(f"| {label} | {val1:.2f} | {val2:.2f} | {diff:+.2f} |")
+                        elif stat in ['good_game_pct']:
+                            report.append(f"| {label} | {val1:.1f}% | {val2:.1f}% | {diff:+.1f}% |")
+                        elif stat in ['innings_pitched']:
+                            report.append(f"| {label} | {val1:.1f} | {val2:.1f} | {diff:+.1f} |")
+                        else:
+                            report.append(f"| {label} | {val1} | {val2} | {diff:+} |")
+            
+        # Add key insights section    
+        report.append(f"\n## Key Insights")
+        
+        if insights:
+            for insight in insights:
+                report.append(f"- {insight}")
+        else:
+            report.append("- Insufficient data for detailed insights")
+            
+        # Add pitch mix section
+        if 'pitch_mix' in self.analysis_results:
+            report.append("\n## Pitch Mix")
+            
+            season1_mix = self.analysis_results['pitch_mix']['season1']
+            season2_mix = self.analysis_results['pitch_mix']['season2']
+            
+            # Table header
+            report.append("| Pitch Type | " + 
+                         f"{self.season1} Season | " + 
+                         f"{self.season2} Season | Change |")
+            report.append("|------------|--------------|--------------|--------|")
+            
+            # Table rows
+            for pitch in sorted(set(season1_mix.keys()) | set(season2_mix.keys())):
+                pct1 = season1_mix.get(pitch, 0)
+                pct2 = season2_mix.get(pitch, 0)
+                change = pct2 - pct1
+                
+                report.append(f"| {pitch} | {pct1:.1f}% | {pct2:.1f}% | {change:+.1f}% |")
+        
+        # Add velocity section
+        if 'velocity' in self.analysis_results:
+            report.append("\n## Pitch Velocity")
+            
+            season1_velo = self.analysis_results['velocity']['season1']
+            season2_velo = self.analysis_results['velocity']['season2']
+            
+            # Table header
+            report.append("| Pitch Type | " + 
+                         f"{self.season1} Season | " + 
+                         f"{self.season2} Season | Change |")
+            report.append("|------------|--------------|--------------|--------|")
+            
+            # Table rows
+            for pitch in sorted(set(season1_velo.keys()) | set(season2_velo.keys())):
+                velo1 = season1_velo.get(pitch, 0)
+                velo2 = season2_velo.get(pitch, 0)
+                change = velo2 - velo1
+                
+                report.append(f"| {pitch} | {velo1:.1f} mph | {velo2:.1f} mph | {change:+.1f} mph |")
+        
+        # Add overall stats section
+        if hasattr(self, 'game_logs1') and hasattr(self, 'game_logs2'):
+            report.append("\n## Performance Metrics")
+            
+            # Collect common metrics
+            metrics = {
+                'ip_numeric': 'Innings Pitched per Game',
+                'strikeOuts': 'Strikeouts per Game',
+                'baseOnBalls': 'Walks per Game',
+                'hits': 'Hits Allowed per Game',
+                'homeRuns': 'Home Runs Allowed per Game',
+                'gameScore': 'Average Game Score'
+            }
+            
+            available_metrics = {k: v for k, v in metrics.items() 
+                               if k in self.game_logs1.columns and k in self.game_logs2.columns}
+            
+            if available_metrics:
+                # Table header
+                report.append("| Metric | " + 
+                             f"{self.season1} Season | " + 
+                             f"{self.season2} Season | Change |")
+                report.append("|--------|--------------|--------------|--------|")
+                
+                # Table rows
+                for metric, label in available_metrics.items():
+                    val1 = self.game_logs1[metric].mean()
+                    val2 = self.game_logs2[metric].mean()
+                    change = val2 - val1
+                    
+                    report.append(f"| {label} | {val1:.2f} | {val2:.2f} | {change:+.2f} |")
+            else:
+                report.append("Insufficient common metrics available for comparison")
+        
+        # Add recommendations section
+        report.append("\n## Recommendations")
+        
+        if insights:
+            # Create recommendations based on insights
+            recommendations = []
+            
+            # Check for velocity insights
+            velo_insights = [i for i in insights if "velocity" in i.lower()]
+            if velo_insights:
+                for insight in velo_insights[:2]:
+                    if "decreased" in insight:
+                        pitch = insight.split("velocity")[0].strip()
+                        recommendations.append(f"Focus on strengthening and mechanics to regain {pitch} velocity")
+            
+            # Check for pitch mix insights
+            mix_insights = [i for i in insights if "usage" in i.lower()]
+            if mix_insights:
+                mix_changes = []
+                for insight in mix_insights:
+                    if "increased" in insight:
+                        pitch = insight.split("Increased ")[1].split(" usage")[0]
+                        mix_changes.append((pitch, "increased"))
+                    elif "decreased" in insight:
+                        pitch = insight.split("Decreased ")[1].split(" usage")[0]
+                        mix_changes.append((pitch, "decreased"))
+                
+                if mix_changes:
+                    effective_pitches = []
+                    ineffective_pitches = []
+                    
+                    # Attempt to identify effectiveness from other insights
+                    game_score_improved = any("Game Score improved" in i for i in insights)
+                    
+                    for pitch, change in mix_changes:
+                        if (game_score_improved and change == "increased") or (not game_score_improved and change == "decreased"):
+                            effective_pitches.append(pitch)
+                        else:
+                            ineffective_pitches.append(pitch)
+                    
+                    if effective_pitches:
+                        recommendations.append(f"Continue to emphasize {', '.join(effective_pitches)} in pitch selection")
+                    if ineffective_pitches:
+                        recommendations.append(f"Re-evaluate approach with {', '.join(ineffective_pitches)}")
+            
+            # Check for location insights
+            loc_insights = [i for i in insights if "command" in i or "located" in i]
+            if loc_insights:
+                recommendations.append("Work on command consistency across seasons")
+            
+            # Add recommendations to report
+            for rec in recommendations:
+                report.append(f"- {rec}")
+        else:
+            report.append("Insufficient data for specific recommendations")
+        
+        return "\n".join(report)
+    
+    def run_analysis(self):
+        """Main method to run the complete analysis workflow"""
+        # Get pitcher name
+        name = input("Enter pitcher name to search: ")
+        search_results = self.search_pitcher(name)
+        
+        if not search_results:
+            print("No players found.")
+            return
+            
+        self.select_pitcher(search_results)
+        
+        # Get two seasons to compare
+        current_year = datetime.now().year
+        season1 = int(input(f"Enter first season to analyze (2015-{current_year}): "))
+        season2 = int(input(f"Enter second season to analyze (2015-{current_year}): "))
+        
+        if season1 == season2:
+            print("Error: Please select two different seasons to compare.")
+            return
+        
+        # Allow user to set custom thresholds for good and bad outings
+        try:
+            good_threshold = int(input("Enter Game Score threshold for 'good' outings (default: 60): ") or "60")
+            bad_threshold = int(input("Enter Game Score threshold for 'bad' outings (default: 40): ") or "40")
+            
+            # Validate thresholds
+            if good_threshold <= bad_threshold:
+                print("Warning: 'Good' threshold should be higher than 'bad' threshold.")
+                print("Using default values: Good ≥ 60, Bad ≤ 40")
+                self.good_threshold = 60
+                self.bad_threshold = 40
+            else:
+                self.good_threshold = good_threshold
+                self.bad_threshold = bad_threshold
+        except ValueError:
+            print("Invalid input. Using default values: Good ≥ 60, Bad ≤ 40")
+            self.good_threshold = 60
+            self.bad_threshold = 40
+        
+        print(f"Analyzing {self.pitcher['fullName']} for {season1} vs {season2}...")
+        print(f"Using Game Score thresholds: Good ≥ {self.good_threshold}, Bad ≤ {self.bad_threshold}")
+        
+        # Try multiple times with different methods to get the data
+        for attempt in range(3):
+            print(f"\nData retrieval attempt {attempt+1}/3:")
+            success = self.fetch_data_for_both_seasons(season1, season2)
+            
+            if success:
+                break
+            elif attempt < 2:
+                print(f"Retrying with different data sources...")
+                time.sleep(2)  # Wait before retrying
+        
+        if success:
+            # Check if we have summary-only data
+            has_summary_data = False
+            if hasattr(self, 'combined_game_logs') and 'is_summary' in self.combined_game_logs.columns:
+                has_summary_data = self.combined_game_logs['is_summary'].any()
+            
+            self.calculate_game_scores()
+            self.classify_performances()
+            self.calculate_season_stats()
+            
+            if has_summary_data:
+                print("\nWARNING: Using season summary data only. Detailed game-by-game analysis not available.")
+                print("Only overall season comparisons will be shown.")
+                
+                # Generate a simplified report
+                report = self.generate_season_summary_report()
+                print(report)
+                return report
+            
+            # Try to get pitch data, but continue even if we can't
+            pitch_data_available = False
+            try:
+                self.fetch_pitch_data()
+                pitch_data_available = self.pitch_data is not None and not self.pitch_data.empty
+            except Exception as e:
+                print(f"Error fetching pitch data: {e}")
+                print("Continuing with limited analysis...")
+            
+            if pitch_data_available:
+                # Run pitch-level analyses
+                try:
+                    self.analyze_pitch_mix()
+                    self.analyze_velocity()
+                    self.analyze_location()
+                    self.analyze_count_leverage()
+                    self.analyze_performance_categories()
+                except Exception as e:
+                    print(f"Error in pitch analysis: {e}")
+                    print("Continuing with limited analysis...")
+            
+            # Generate insights and report
+            try:
+                report = self.generate_report()
+                print(report)
+            except Exception as e:
+                print(f"Error generating report: {e}")
+                print("Generating simplified report instead...")
+                report = self.generate_season_summary_report()
+                print(report)
+            
+            # Create visualizations if possible
+            try:
+                visualizations = self.create_visualizations()
+                
+                # Save all visualizations to files
+                self.save_visualizations(visualizations)
+                
+                # Display visualizations
+                for name, fig in visualizations.items():
+                    if fig:
+                        plt.figure(fig.number)
+                        plt.show()
+            except Exception as e:
+                print(f"Error creating visualizations: {e}")
+            
+            return report
+        else:
+            # Last resort: Try to get just basic player info for the seasons
+            print("\nAttempting to get basic player info as last resort...")
+            try:
+                s1_info = statsapi.player_stat_data(self.mlbam_id, season1, "pitching")
+                s2_info = statsapi.player_stat_data(self.mlbam_id, season2, "pitching")
+                
+                print("\nBasic player statistics:")
+                print(f"\n{season1} Season:")
+                if s1_info and 'stats' in s1_info and len(s1_info['stats']) > 0:
+                    for stat, value in s1_info['stats'][0].items():
+                        print(f"  {stat}: {value}")
+                else:
+                    print("  No data available")
+                
+                print(f"\n{season2} Season:")
+                if s2_info and 'stats' in s2_info and len(s2_info['stats']) > 0:
+                    for stat, value in s2_info['stats'][0].items():
+                        print(f"  {stat}: {value}")
+                else:
+                    print("  No data available")
+                
+                return "Analysis completed with minimal data"
+            except Exception as e:
+                print(f"Error retrieving basic player info: {e}")
+                return "Analysis failed: Unable to retrieve any data for comparison"
+    
+    def generate_season_summary_report(self):
+        """Generate a simplified report when only season summary data is available"""
+        if not hasattr(self, 'season_stats') or not self.season_stats:
+            return "No season statistics available for report"
+            
+        report = [
+            f"# {self.pitcher['fullName']} Year-to-Year Comparison ({self.season1} vs {self.season2}) - Summary Only",
+            f"\n## Overview",
+            f"Limited data available for analysis. Showing season totals only."
+        ]
+        
+        # Add season stats comparison
+        if self.season1 in self.season_stats and self.season2 in self.season_stats:
+            s1_stats = self.season_stats[self.season1]
+            s2_stats = self.season_stats[self.season2]
+            
+            if s1_stats and s2_stats:
+                report.append(f"\n## Season Statistics")
+                
+                # Table header
+                report.append("| Statistic | " + 
+                             f"{self.season1} | " + 
+                             f"{self.season2} | Change |")
+                report.append("|-----------|-------|-------|--------|")
+                
+                # Selected stats to show
+                stat_display = {
+                    'games': 'Games',
+                    'gamesStarted': 'Games Started',
+                    'innings_pitched': 'Innings Pitched',
+                    'strikeOuts': 'Strikeouts',
+                    'baseOnBalls': 'Walks',
+                    'hits': 'Hits Allowed',
+                    'homeRuns': 'Home Runs',
+                    'era': 'ERA',
+                    'whip': 'WHIP',
+                    'k9': 'K/9',
+                    'bb9': 'BB/9',
+                    'kbb': 'K/BB Ratio',
+                    'wins': 'Wins',
+                    'losses': 'Losses'
+                }
+                
+                # Add each stat to report if available
+                for stat, label in stat_display.items():
+                    if stat in s1_stats and stat in s2_stats:
+                        val1 = s1_stats[stat]
+                        val2 = s2_stats[stat]
+                        diff = val2 - val1
+                        
+                        # Format differently depending on stat
+                        if stat in ['era', 'whip', 'k9', 'bb9', 'kbb']:
+                            report.append(f"| {label} | {val1:.2f} | {val2:.2f} | {diff:+.2f} |")
+                        elif stat in ['innings_pitched']:
+                            report.append(f"| {label} | {val1:.1f} | {val2:.1f} | {diff:+.1f} |")
+                        else:
+                            report.append(f"| {label} | {val1} | {val2} | {diff:+} |")
+                            
+                # Add a summary conclusion
+                era_diff = s2_stats.get('era', 0) - s1_stats.get('era', 0)
+                whip_diff = s2_stats.get('whip', 0) - s1_stats.get('whip', 0)
+                k9_diff = s2_stats.get('k9', 0) - s1_stats.get('k9', 0)
+                
+                report.append("\n## Summary")
+                
+                if era_diff < -0.25 and whip_diff < -0.1:
+                    report.append(f"{self.pitcher['fullName']} showed significant improvement from {self.season1} to {self.season2}, " + 
+                                 f"with ERA decreasing by {abs(era_diff):.2f} points and WHIP decreasing by {abs(whip_diff):.2f}.")
+                elif era_diff > 0.25 and whip_diff > 0.1:
+                    report.append(f"{self.pitcher['fullName']} showed a performance decline from {self.season1} to {self.season2}, " + 
+                                 f"with ERA increasing by {era_diff:.2f} points and WHIP increasing by {whip_diff:.2f}.")
+                else:
+                    report.append(f"{self.pitcher['fullName']} maintained similar performance levels between {self.season1} and {self.season2}, " + 
+                                 f"with ERA changing by {era_diff:+.2f} and WHIP changing by {whip_diff:+.2f}.")
+                
+                if abs(k9_diff) >= 0.5:
+                    direction = "increasing" if k9_diff > 0 else "decreasing"
+                    report.append(f"Strikeout rate changed notably, {direction} by {abs(k9_diff):.2f} K/9 from {self.season1} to {self.season2}.")
+            
+        return "\n".join(report)
+        
+    def save_visualizations(self, visualizations, output_dir="pitcher_analysis"):
+        """Save all visualizations to files"""
+        if not visualizations:
+            print("No visualizations to save")
+            return []
+            
+        # Create directory if it doesn't exist
+        try:
+            if not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+                print(f"Created directory: {output_dir}")
+        except Exception as e:
+            print(f"Error creating directory: {e}")
+            return []
+            
+        # Generate a timestamp for the filenames
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create a pitcher-specific folder
+        pitcher_name = self.pitcher['fullName'].replace(" ", "_")
+        seasons_str = f"{self.season1}_vs_{self.season2}"
+        pitcher_dir = os.path.join(output_dir, f"{pitcher_name}_{seasons_str}_{timestamp}")
+        
+        try:
+            os.makedirs(pitcher_dir)
+        except Exception as e:
+            print(f"Error creating pitcher directory: {e}")
+            # Fall back to the main directory
+            pitcher_dir = output_dir
+            
+        # Save each visualization
+        saved_files = []
+        for name, fig in visualizations.items():
+            if fig:
+                try:
+                    # Generate filename
+                    filename = os.path.join(pitcher_dir, f"{name}.png")
+                    
+                    # Save figure
+                    plt.figure(fig.number)
+                    plt.savefig(filename, dpi=300, bbox_inches='tight')
+                    
+                    saved_files.append(filename)
+                    print(f"Saved visualization: {filename}")
+                except Exception as e:
+                    print(f"Error saving visualization '{name}': {e}")
+        
+        if saved_files:
+            print(f"\nSuccessfully saved {len(saved_files)} visualizations to: {pitcher_dir}")
+        
+        return saved_files
+        
+        # Add season stats comparison
+        if self.season1 in self.season_stats and self.season2 in self.season_stats:
+            s1_stats = self.season_stats[self.season1]
+            s2_stats = self.season_stats[self.season2]
+            
+            if s1_stats and s2_stats:
+                report.append(f"\n## Season Statistics")
+                
+                # Table header
+                report.append("| Statistic | " + 
+                             f"{self.season1} | " + 
+                             f"{self.season2} | Change |")
+                report.append("|-----------|-------|-------|--------|")
+                
+                # Selected stats to show
+                stat_display = {
+                    'games': 'Games',
+                    'gamesStarted': 'Games Started',
+                    'innings_pitched': 'Innings Pitched',
+                    'strikeOuts': 'Strikeouts',
+                    'baseOnBalls': 'Walks',
+                    'hits': 'Hits Allowed',
+                    'homeRuns': 'Home Runs',
+                    'era': 'ERA',
+                    'whip': 'WHIP',
+                    'k9': 'K/9',
+                    'bb9': 'BB/9',
+                    'kbb': 'K/BB Ratio',
+                    'wins': 'Wins',
+                    'losses': 'Losses'
+                }
+                
+                # Add each stat to report if available
+                for stat, label in stat_display.items():
+                    if stat in s1_stats and stat in s2_stats:
+                        val1 = s1_stats[stat]
+                        val2 = s2_stats[stat]
+                        diff = val2 - val1
+                        
+                        # Format differently depending on stat
+                        if stat in ['era', 'whip', 'k9', 'bb9', 'kbb']:
+                            report.append(f"| {label} | {val1:.2f} | {val2:.2f} | {diff:+.2f} |")
+                        elif stat in ['innings_pitched']:
+                            report.append(f"| {label} | {val1:.1f} | {val2:.1f} | {diff:+.1f} |")
+                        else:
+                            report.append(f"| {label} | {val1} | {val2} | {diff:+} |")
+                            
+                # Add a summary conclusion
+                era_diff = s2_stats.get('era', 0) - s1_stats.get('era', 0)
+                whip_diff = s2_stats.get('whip', 0) - s1_stats.get('whip', 0)
+                k9_diff = s2_stats.get('k9', 0) - s1_stats.get('k9', 0)
+                
+                report.append("\n## Summary")
+                
+                if era_diff < -0.25 and whip_diff < -0.1:
+                    report.append(f"{self.pitcher['fullName']} showed significant improvement from {self.season1} to {self.season2}, " + 
+                                 f"with ERA decreasing by {abs(era_diff):.2f} points and WHIP decreasing by {abs(whip_diff):.2f}.")
+                elif era_diff > 0.25 and whip_diff > 0.1:
+                    report.append(f"{self.pitcher['fullName']} showed a performance decline from {self.season1} to {self.season2}, " + 
+                                 f"with ERA increasing by {era_diff:.2f} points and WHIP increasing by {whip_diff:.2f}.")
+                else:
+                    report.append(f"{self.pitcher['fullName']} maintained similar performance levels between {self.season1} and {self.season2}, " + 
+                                 f"with ERA changing by {era_diff:+.2f} and WHIP changing by {whip_diff:+.2f}.")
+                
+                if abs(k9_diff) >= 0.5:
+                    direction = "increasing" if k9_diff > 0 else "decreasing"
+                    report.append(f"Strikeout rate changed notably, {direction} by {abs(k9_diff):.2f} K/9 from {self.season1} to {self.season2}.")
+            
+        return "\n".join(report)
+
+if __name__ == "__main__":
+    analyzer = MLBPitcherYearComparer()
+    analyzer.run_analysis()
