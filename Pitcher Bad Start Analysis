@@ -1,0 +1,3587 @@
+#Analyzes why the pitcher struggled in a recent game
+import statsapi
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+import pybaseball
+from pybaseball import statcast_pitcher, playerid_lookup, statcast
+import os
+import warnings
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.patches import Rectangle
+from matplotlib.lines import Line2D
+warnings.filterwarnings('ignore')
+
+
+class MLBPitcherBadStartAnalyzer:
+    """Analyzes why a pitcher's performance was bad compared to recent good starts"""
+    
+    def __init__(self):
+        self.pitcher = None
+        self.bad_game_data = None
+        self.good_games_data = None
+        self.mlbam_id = None
+        self.bad_game_date = None
+        self.bad_game_id = None
+        self.output_dir = 'pitcher_analysis_output'
+        self.bad_game_score = None
+        self.good_games_metrics = None
+        self.pitch_type_map = {
+            'FF': 'Four-Seam Fastball',
+            'SI': 'Sinker',
+            'FC': 'Cutter',
+            'SL': 'Slider',
+            'CU': 'Curveball',
+            'CH': 'Changeup',
+            'FS': 'Splitter',
+            'KN': 'Knuckleball',
+            'FO': 'Forkball',
+            'SC': 'Screwball',
+            'ST': 'Sweeper',
+            'EP': 'Eephus',
+            'KC': 'Knuckle-Curve',
+            'CS': 'Slow Curve',
+            'FA': 'Fastball',
+            'FT': 'Two-Seam Fastball'
+        }
+        
+    def search_pitcher(self, name):
+        """Search for a pitcher by name using MLB Stats API"""
+        try:
+            search_results = statsapi.lookup_player(name)
+            pitchers = [player for player in search_results 
+                       if player.get('primaryPosition', {}).get('code', '') == '1']
+            return pitchers if pitchers else search_results
+        except Exception as e:
+            print(f"Error searching for player via MLB Stats API: {e}")
+            # Try using pybaseball as fallback
+            try:
+                player_id_df = playerid_lookup(name.split()[1], name.split()[0])
+                if not player_id_df.empty:
+                    # Convert pybaseball results to format similar to statsapi
+                    search_results = []
+                    for _, row in player_id_df.iterrows():
+                        search_results.append({
+                            'id': int(row['key_mlbam']),
+                            'fullName': f"{row['name_first']} {row['name_last']}",
+                            'primaryPosition': {'code': '1', 'name': 'Pitcher'},
+                            'currentTeam': {'name': row.get('team_name', 'Unknown')},
+                            'key_fangraphs': row.get('key_fangraphs', None)
+                        })
+                    return search_results
+            except Exception as e2:
+                print(f"Error searching via pybaseball: {e2}")
+            return []
+    
+    def select_pitcher(self, search_results):
+        """Let user select a pitcher from search results"""
+        print("\nFound the following players:")
+        for i, player in enumerate(search_results):
+            position = player.get('primaryPosition', {}).get('name', 'Unknown')
+            team = player.get('currentTeam', {}).get('name', 'Free Agent')
+            print(f"{i+1}. {player['fullName']} - {position} - {team}")
+        
+        selection = int(input("\nEnter the number of the player to analyze: "))
+        self.pitcher = search_results[selection-1]
+        self.mlbam_id = self.pitcher['id']
+        return self.pitcher
+    
+    def find_recent_games(self, days_lookback=365, max_games=30):
+        """Find games for a pitcher extending back to the previous season"""
+        try:
+            # Get schedule data for games extending back to previous season
+            end_date = datetime.now().strftime('%Y-%m-%d')
+            
+            # Calculate a date that's likely to include the previous season
+            # Use 365 days by default to include a full year
+            start_date = (datetime.now() - timedelta(days=days_lookback)).strftime('%Y-%m-%d')
+            
+            print(f"Looking for games from {start_date} to {end_date}")
+            print("(This search extends back to the previous season)")
+            
+            # Get pitcher's appearances in this time frame
+            pitcher_data = statcast_pitcher(start_date, end_date, self.mlbam_id)
+            
+            if pitcher_data.empty:
+                print(f"No games found for {self.pitcher['fullName']} in the specified timeframe")
+                
+                # If no games found, try extending the lookback period even further
+                extended_start_date = (datetime.now() - timedelta(days=730)).strftime('%Y-%m-%d')  # 2 years
+                print(f"\nTrying with extended timeframe: {extended_start_date} to {end_date}")
+                pitcher_data = statcast_pitcher(extended_start_date, end_date, self.mlbam_id)
+                
+                if pitcher_data.empty:
+                    print(f"Still no games found for {self.pitcher['fullName']}")
+                    return None
+            
+            # Group by game to identify individual appearances
+            game_ids = pitcher_data['game_pk'].unique()
+            
+            if len(game_ids) == 0:
+                print("No games found")
+                return None
+                
+            print(f"Found {len(game_ids)} appearances")
+            
+            # Calculate game metrics for each appearance
+            game_metrics = []
+            
+            for game_id in game_ids:
+                game_data = pitcher_data[pitcher_data['game_pk'] == game_id]
+                
+                # Calculate game metrics
+                game_date = pd.to_datetime(game_data['game_date'].iloc[0])
+                pitches_thrown = len(game_data)
+                
+                # Get opponent
+                try:
+                    home_team = game_data['home_team'].iloc[0]
+                    away_team = game_data['away_team'].iloc[0]
+                    
+                    # Try to determine pitcher's team
+                    if 'pitcher_team' in game_data.columns:
+                        pitcher_team = game_data['pitcher_team'].iloc[0]
+                        opponent = away_team if pitcher_team == home_team else home_team
+                    else:
+                        # Alternative approach
+                        if hasattr(self, 'pitcher') and 'currentTeam' in self.pitcher:
+                            pitcher_team_name = self.pitcher['currentTeam'].get('name', '')
+                            if pitcher_team_name:
+                                if pitcher_team_name.lower() in home_team.lower():
+                                    opponent = away_team
+                                elif pitcher_team_name.lower() in away_team.lower():
+                                    opponent = home_team
+                                else:
+                                    opponent = f"{away_team} @ {home_team}"
+                            else:
+                                opponent = f"{away_team} @ {home_team}"
+                        else:
+                            opponent = f"{away_team} @ {home_team}"
+                except Exception as e:
+                    print(f"Could not determine opponent: {e}")
+                    opponent = "Unknown"
+                
+                # Count events
+                strikeouts = sum(game_data['events'] == 'strikeout')
+                walks = sum(game_data['events'] == 'walk')
+                hits = sum(game_data['events'].isin(['single', 'double', 'triple', 'home_run']))
+                home_runs = sum(game_data['events'] == 'home_run')
+                
+                # Estimate innings pitched
+                outs_recorded = sum(game_data['events'].isin([
+                    'strikeout', 'field_out', 'force_out', 'grounded_into_double_play', 
+                    'double_play', 'triple_play'
+                ]))
+                innings_pitched = outs_recorded / 3
+                
+                # Format innings for display
+                innings_display = f"{int(innings_pitched)}.{int((innings_pitched % 1) * 3)}"
+                
+                # Calculate game score (Bill James metric)
+                estimated_er = home_runs + 0.5 * (hits - home_runs)
+                game_score = 50 + innings_pitched + strikeouts - walks - (2 * hits) - (4 * estimated_er) - (2 * home_runs)
+                
+                # Add to metrics
+                game_metrics.append({
+                    'game_id': game_id,
+                    'game_date': game_date,
+                    'opponent': opponent,
+                    'pitches_thrown': pitches_thrown,
+                    'innings_pitched': innings_pitched,
+                    'innings_display': innings_display,
+                    'strikeouts': strikeouts,
+                    'walks': walks,
+                    'hits': hits,
+                    'home_runs': home_runs,
+                    'game_score': game_score,
+                    'k_per_9': (strikeouts / innings_pitched) * 9 if innings_pitched > 0 else 0,
+                    'bb_per_9': (walks / innings_pitched) * 9 if innings_pitched > 0 else 0,
+                    'whip': (hits + walks) / innings_pitched if innings_pitched > 0 else 0
+                })
+            
+            # Convert to DataFrame and sort by date (most recent first)
+            game_metrics_df = pd.DataFrame(game_metrics).sort_values('game_date', ascending=False)
+            
+            # Categorize games as good or bad based on GameScore
+            # GameScore: 50 is average, below 40 is bad, above 60 is good
+            game_metrics_df['performance'] = 'average'
+            game_metrics_df.loc[game_metrics_df['game_score'] < 40, 'performance'] = 'bad'
+            game_metrics_df.loc[game_metrics_df['game_score'] >= 60, 'performance'] = 'good'
+            
+            # Display the games for selection
+            print("\nRecent appearances (sorted by date, most recent first):")
+            print("----------------------------------------------------------------------")
+            print(f"{'#':<3} {'Date':<12} {'Opponent':<20} {'IP':<5} {'K':<3} {'BB':<3} {'H':<3} {'HR':<3} {'Score':<6} {'Rating':<8}")
+            print("----------------------------------------------------------------------")
+            
+            for i, (_, game) in enumerate(game_metrics_df.iterrows()):
+                date_str = game['game_date'].strftime('%Y-%m-%d')
+                opponent_str = game['opponent'][:18]  # Truncate long names
+                performance = game['performance']
+                
+                # Color coding for performance
+                if performance == 'good':
+                    performance_str = "\033[92m" + "GOOD" + "\033[0m"  # Green
+                elif performance == 'bad':
+                    performance_str = "\033[91m" + "BAD" + "\033[0m"   # Red
+                else:
+                    performance_str = "\033[93m" + "AVG" + "\033[0m"   # Yellow
+                
+                print(f"{i+1:<3} {date_str:<12} {opponent_str:<20} {game['innings_display']:<5} "
+                      f"{game['strikeouts']:<3} {game['walks']:<3} {game['hits']:<3} {game['home_runs']:<3} "
+                      f"{game['game_score']:<6.1f} {performance_str:<8}")
+            
+            print("----------------------------------------------------------------------")
+            
+            # Let user select a bad start
+            bad_games = game_metrics_df[game_metrics_df['performance'] == 'bad']
+            if bad_games.empty:
+                print("\nNo clearly bad starts found in the selected timeframe. Would you like to:")
+                print("1. Select a start that was below average")
+                print("2. Select any start for analysis")
+                option = int(input("\nEnter your choice (1-2): "))
+                
+                if option == 1:
+                    bad_games = game_metrics_df[game_metrics_df['game_score'] < 50]
+                    if bad_games.empty:
+                        print("No below-average starts found. Showing all starts.")
+                        bad_games = game_metrics_df
+                else:
+                    bad_games = game_metrics_df
+            
+            # Let user select a bad start
+            print("\nSelect a bad/suboptimal start to analyze:")
+            bad_indices = []
+            for i, (idx, game) in enumerate(bad_games.iterrows()):
+                date_str = game['game_date'].strftime('%Y-%m-%d')
+                row_index = game_metrics_df.index.get_loc(idx) + 1  # Get the row number from the displayed list
+                print(f"{i+1}. [{row_index}] {date_str} vs {game['opponent']} - GameScore: {game['game_score']:.1f}")
+                bad_indices.append(row_index - 1)  # Store index for later reference
+            
+            bad_selection = int(input("\nEnter the number of the bad start to analyze: ")) - 1
+            selected_bad_game = bad_games.iloc[bad_selection]
+            self.bad_game_id = selected_bad_game['game_id']
+            self.bad_game_date = selected_bad_game['game_date']
+            
+            print(f"\nSelected bad start: {selected_bad_game['game_date'].strftime('%Y-%m-%d')} "
+                  f"vs {selected_bad_game['opponent']} (GameScore: {selected_bad_game['game_score']:.1f})")
+            
+            # Now let user select a single good start to compare with
+            good_games = game_metrics_df[game_metrics_df['performance'] == 'good']
+            if good_games.empty:
+                print("\nNo clearly good starts found. Using the best available start for comparison.")
+                # Get the best game by GameScore
+                good_games = game_metrics_df.sort_values('game_score', ascending=False).head(3)
+            
+            # Let user select a good start
+            print("\nSelect a good start to compare with (includes previous season):")
+            good_indices = []
+            for i, (idx, game) in enumerate(good_games.iterrows()):
+                date_str = game['game_date'].strftime('%Y-%m-%d')
+                row_index = game_metrics_df.index.get_loc(idx) + 1  # Get the row number from the displayed list
+                print(f"{i+1}. [{row_index}] {date_str} vs {game['opponent']} - GameScore: {game['game_score']:.1f}")
+                good_indices.append(row_index - 1)  # Store index for later reference
+            
+            good_selection = int(input("\nEnter the number of the good start to compare with: ")) - 1
+            selected_good_game = good_games.iloc[good_selection]
+            self.good_game_id = selected_good_game['game_id']
+            self.good_game_date = selected_good_game['game_date']
+            
+            print(f"\nSelected good start: {selected_good_game['game_date'].strftime('%Y-%m-%d')} "
+                  f"vs {selected_good_game['opponent']} (GameScore: {selected_good_game['game_score']:.1f})")
+            
+            # Store both game metrics for later use
+            self.bad_game_metrics = selected_bad_game
+            self.good_game_metrics = selected_good_game
+            
+            return {
+                'bad_game': selected_bad_game,
+                'good_game': selected_good_game,
+                'all_games': game_metrics_df
+            }
+            
+        except Exception as e:
+            print(f"Error finding games: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def fetch_game_data(self, game_id, game_date):
+        """Fetch pitch data for a specific game"""
+        try:
+            print(f"Fetching pitch data for game {game_id}...")
+            
+            # Format date for Statcast query
+            game_date_str = game_date.strftime('%Y-%m-%d')
+            
+            # Get data for the game day
+            data = statcast(game_date_str, game_date_str)
+            
+            if data.empty:
+                print(f"No Statcast data found for {game_date_str}")
+                return None
+            
+            # Filter to the specific game
+            game_data = data[data['game_pk'] == game_id]
+            
+            if game_data.empty:
+                print(f"No pitch data found for game ID {game_id}")
+                return None
+                
+            # Filter to only this pitcher's pitches
+            pitcher_data = game_data[game_data['pitcher'] == self.mlbam_id]
+            
+            if pitcher_data.empty:
+                print(f"No pitches found for pitcher ID {self.mlbam_id} in this game")
+                return None
+            
+            # Add pitch result classification
+            pitcher_data['pitch_result'] = 'neutral'
+            
+            # Good results
+            good_events = ['strikeout', 'field_out', 'force_out', 'grounded_into_double_play', 
+                          'double_play', 'triple_play', 'sac_fly', 'sac_bunt']
+            pitcher_data.loc[pitcher_data['events'].isin(good_events), 'pitch_result'] = 'good'
+            
+            # Bad results
+            bad_events = ['single', 'double', 'triple', 'home_run', 'walk', 'hit_by_pitch']
+            pitcher_data.loc[pitcher_data['events'].isin(bad_events), 'pitch_result'] = 'bad'
+            
+            # Add additional classification based on launch data
+            has_launch_data = ~pitcher_data['launch_speed'].isna() & ~pitcher_data['launch_angle'].isna()
+            
+            # Weak contact (good for pitcher)
+            weak_contact = (pitcher_data['launch_speed'] < 85) & has_launch_data
+            pitcher_data.loc[weak_contact & (pitcher_data['pitch_result'] == 'neutral'), 'pitch_result'] = 'good'
+            
+            # Hard contact (bad for pitcher)
+            hard_contact = (pitcher_data['launch_speed'] > 95) & has_launch_data
+            pitcher_data.loc[hard_contact & (pitcher_data['pitch_result'] == 'neutral'), 'pitch_result'] = 'bad'
+            
+            # Add strike/ball classification
+            pitcher_data['strike_ball'] = 'unknown'
+            pitcher_data.loc[pitcher_data['type'] == 'S', 'strike_ball'] = 'strike'
+            pitcher_data.loc[pitcher_data['type'] == 'B', 'strike_ball'] = 'ball'
+            
+            # Add count information
+            pitcher_data['count'] = pitcher_data['balls'].astype(str) + '-' + pitcher_data['strikes'].astype(str)
+            
+            # Clean up column names
+            pitcher_data = pitcher_data.rename(columns={
+                'pitch_type': 'pitch_type',
+                'release_speed': 'velocity',
+                'release_spin_rate': 'spin_rate',
+                'plate_x': 'location_x',
+                'plate_z': 'location_z',
+                'balls': 'balls',
+                'strikes': 'strikes',
+                'game_pk': 'game_id'
+            })
+            
+            # Add inning related data for analysis
+            pitcher_data['early_inning'] = pitcher_data['inning'] <= 3
+            pitcher_data['late_inning'] = pitcher_data['inning'] >= 5
+            
+            # Add batter stance info for analysis
+            pitcher_data['batter_side_matches'] = pitcher_data['p_throws'] == pitcher_data['stand']
+            
+            # Add pitch count info
+            pitcher_data['high_pitch_count'] = pitcher_data['pitch_number'] >= 70
+            
+            return pitcher_data
+            
+        except Exception as e:
+            print(f"Error fetching game pitch data: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def calculate_game_score(self, game_data):
+        """Calculate Bill James' Game Score for a game"""
+        if game_data is None or game_data.empty:
+            print("No game data available for GameScore calculation")
+            return None
+            
+        try:
+            # Count events
+            strikeouts = sum(game_data['events'] == 'strikeout')
+            walks = sum(game_data['events'] == 'walk')
+            hits = sum(game_data['events'].isin(['single', 'double', 'triple', 'home_run']))
+            home_runs = sum(game_data['events'] == 'home_run')
+            
+            # Estimate innings pitched from outs recorded
+            outs_recorded = sum(game_data['events'].isin([
+                'strikeout', 'field_out', 'force_out', 'grounded_into_double_play', 
+                'double_play', 'triple_play'
+            ]))
+            innings_pitched = outs_recorded / 3
+            
+            # Estimate earned runs
+            estimated_er = home_runs + 0.5 * (hits - home_runs)
+            
+            # Calculate Game Score (Bill James original version)
+            game_score = 50
+            game_score += innings_pitched
+            game_score += strikeouts
+            game_score -= walks
+            game_score -= (2 * hits)
+            game_score -= (4 * estimated_er)
+            game_score -= (2 * home_runs)
+            
+            # Format innings pitched for display
+            innings_display = f"{int(innings_pitched)}.{int((innings_pitched % 1) * 3)}"
+            
+            print(f"Game Stats: {innings_display} IP, {strikeouts} K, {walks} BB, {hits} H, {home_runs} HR")
+            print(f"Calculated GameScore: {game_score:.0f}")
+            
+            return game_score
+            
+        except Exception as e:
+            print(f"Error calculating GameScore: {e}")
+            return None
+
+    def fetch_all_game_data(self):
+        """Fetch data for the bad start and good start for comparison"""
+        # First, fetch the bad game data
+        print("\nFetching data for the bad start...")
+        self.bad_game_data = self.fetch_game_data(self.bad_game_id, self.bad_game_date)
+        
+        if self.bad_game_data is None or self.bad_game_data.empty:
+            print("Failed to fetch data for the bad start.")
+            return False
+        
+        # Calculate GameScore for the bad game
+        self.bad_game_score = self.calculate_game_score(self.bad_game_data)
+        
+        # Now fetch data for the good game
+        print("\nFetching data for the good start to compare...")
+        
+        self.good_games_data = self.fetch_game_data(self.good_game_id, self.good_game_date)
+        
+        if self.good_games_data is None or self.good_games_data.empty:
+            print("Failed to fetch data for the good start.")
+            return False
+        
+        # Add a game identifier
+        self.good_games_data['game_identifier'] = f"{self.good_game_date.strftime('%Y-%m-%d')} vs {self.good_game_metrics['opponent']}"
+        
+        print(f"Successfully fetched data for comparison. Bad game: {len(self.bad_game_data)} pitches, Good game: {len(self.good_games_data)} pitches")
+        return True
+    
+    def create_pitch_mix_comparison(self):
+        """Create pitch mix comparison between bad start and good starts"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for pitch mix comparison")
+            return None
+        
+        # Calculate pitch mix for bad game
+        bad_game_mix = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        # Calculate pitch mix for good games
+        good_games_mix = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        # Calculate differences
+        pitch_comparison = pd.DataFrame({
+            'Bad Game (%)': bad_game_mix,
+            'Good Games (%)': good_games_mix
+        }).fillna(0)
+        
+        pitch_comparison['Difference'] = pitch_comparison['Bad Game (%)'] - pitch_comparison['Good Games (%)']
+        pitch_comparison['Pitch Name'] = pitch_comparison.index.map(lambda x: self.get_full_pitch_name(x))
+        
+        # Sort by usage in bad game
+        pitch_comparison = pitch_comparison.sort_values('Bad Game (%)', ascending=False)
+        
+        # Filter out pitches with minimal usage
+        pitch_comparison = pitch_comparison[(pitch_comparison['Bad Game (%)'] >= 3) | 
+                                           (pitch_comparison['Good Games (%)'] >= 3)]
+        
+        # Create a figure
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Set up data for plotting
+        pitches = pitch_comparison.index
+        x = np.arange(len(pitches))
+        width = 0.35
+        
+        # Plot bars
+        bad_bars = ax.bar(x - width/2, pitch_comparison['Bad Game (%)'], width, label='Bad Start', color='#ff6b6b')
+        good_bars = ax.bar(x + width/2, pitch_comparison['Good Games (%)'], width, label='Good Starts', color='#4ecdc4')
+        
+        # Add labels and title
+        ax.set_ylabel('Usage (%)')
+        ax.set_title('Pitch Type Usage: Bad Start vs. Good Starts', fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        
+        # Create labels with both pitch code and full name
+        pitch_labels = [f"{pitch}\n({self.get_full_pitch_name(pitch)})" for pitch in pitches]
+        ax.set_xticklabels(pitch_labels)
+        
+        # Add a horizontal grid for easier reading
+        ax.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax.legend()
+        
+        # Add value labels on the bars
+        def add_labels(bars):
+            for bar in bars:
+                height = bar.get_height()
+                ax.annotate(f'{height:.1f}%',
+                           xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3),  # 3 points vertical offset
+                           textcoords="offset points",
+                           ha='center', va='bottom')
+        
+        add_labels(bad_bars)
+        add_labels(good_bars)
+        
+        # Add differential arrows for significant differences
+        for i, pitch in enumerate(pitches):
+            diff = pitch_comparison.loc[pitch, 'Difference']
+            if abs(diff) >= 5:  # Only show significant differences
+                # Calculate positions
+                bad_height = pitch_comparison.loc[pitch, 'Bad Game (%)']
+                good_height = pitch_comparison.loc[pitch, 'Good Games (%)']
+                max_height = max(bad_height, good_height) + 2
+                
+                # Draw arrow
+                arrow_color = 'red' if diff > 0 else 'green'
+                ax.annotate(f"{diff:+.1f}%", 
+                           xy=(i, max_height + 3),
+                           ha='center',
+                           va='bottom',
+                           color=arrow_color,
+                           fontweight='bold')
+                
+                # Add indicator for which is higher
+                if diff > 0:
+                    ax.annotate('↑', xy=(i, max_height), ha='center', va='bottom', 
+                               color='red', fontsize=12, fontweight='bold')
+                else:
+                    ax.annotate('↓', xy=(i, max_height), ha='center', va='bottom', 
+                               color='green', fontsize=12, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_pitch_mix_comparison.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved pitch mix comparison to {fig_path}")
+        
+        return {
+            'figure': fig,
+            'data': pitch_comparison
+        }
+    
+    def create_location_comparison(self):
+        """Create location heatmap comparison between bad start and good starts"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for location comparison")
+            return None
+        
+        # Create figure with 1 row and 2 columns
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 8))
+        
+        # Create strike zone coordinates
+        zone_width = 1.7  # Approx strike zone width (ft)
+        zone_height = 2.0  # Approx strike zone height (ft)
+        zone_left = -zone_width/2
+        zone_right = zone_width/2
+        zone_bottom = 1.5  # Approx strike zone bottom (ft)
+        zone_top = zone_bottom + zone_height
+        
+        # Function to draw a heatmap on an axis
+        def draw_location_heatmap(ax, data, title, color_by_result=True):
+            # Filter out rows with missing location data
+            valid_data = data[~data['location_x'].isna() & ~data['location_z'].isna()]
+            
+            if valid_data.empty:
+                print(f"No valid location data for {title}")
+                ax.text(0, 2.5, "No valid location data", ha='center', fontsize=14)
+                return {}
+            
+            # Draw strike zone
+            ax.plot([zone_left, zone_right, zone_right, zone_left, zone_left],
+                   [zone_bottom, zone_bottom, zone_top, zone_top, zone_bottom],
+                   'k-', lw=2)
+            
+            if color_by_result:
+                # Color points by result
+                for result, color, label in [('good', 'green', 'Good Results'), 
+                                          ('bad', 'red', 'Bad Results'), 
+                                          ('neutral', 'gray', 'Neutral')]:
+                    result_data = valid_data[valid_data['pitch_result'] == result]
+                    if not result_data.empty:
+                        ax.scatter(result_data['location_x'], result_data['location_z'], 
+                                 alpha=0.6, s=80, c=color, label=label)
+            else:
+                # Just plot all points in blue
+                ax.scatter(valid_data['location_x'], valid_data['location_z'], alpha=0.6, s=80, c='blue')
+            
+            # Add contour plot to show density
+            try:
+                if len(valid_data) >= 10:
+                    sns.kdeplot(
+                        x=valid_data['location_x'], 
+                        y=valid_data['location_z'],
+                        cmap='Blues',
+                        alpha=0.4,
+                        ax=ax,
+                        fill=True
+                    )
+            except Exception as e:
+                print(f"Could not generate density plot: {e}")
+            
+            # Set plot properties
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            ax.set_xlim(-3, 3)
+            ax.set_ylim(0, 5)
+            ax.set_xlabel('Horizontal Location (ft)')
+            ax.set_ylabel('Vertical Location (ft)')
+            
+            # Add catcher perspective labels
+            ax.text(2.5, 2.5, "Catcher's Perspective", rotation=90, fontsize=12)
+            ax.text(-2.5, 0.5, "RHH", fontsize=10)
+            ax.text(2.5, 0.5, "LHH", fontsize=10)
+            
+            # Divide strike zone into 9 regions
+            h_third = zone_width / 3
+            v_third = zone_height / 3
+            
+            # Calculate percentage of pitches in each region for the heatmap data
+            regions = {}
+            total_zone_pitches = sum((valid_data['location_x'] >= zone_left) & 
+                                    (valid_data['location_x'] <= zone_right) & 
+                                    (valid_data['location_z'] >= zone_bottom) & 
+                                    (valid_data['location_z'] <= zone_top))
+            
+            # Only do detailed region analysis for larger datasets
+            if total_zone_pitches >= 15:
+                for i, h_pos in enumerate(['Left', 'Middle', 'Right']):
+                    for j, v_pos in enumerate(['Low', 'Middle', 'High']):
+                        # Calculate region boundaries
+                        region_left = zone_left + i * h_third
+                        region_right = region_left + h_third
+                        region_bottom = zone_bottom + j * v_third
+                        region_top = region_bottom + v_third
+                        
+                        # Count pitches in this region
+                        region_pitches = sum((data['location_x'] >= region_left) & 
+                                           (data['location_x'] < region_right) & 
+                                           (data['location_z'] >= region_bottom) & 
+                                           (data['location_z'] < region_top))
+                        
+                        region_pct = (region_pitches / total_zone_pitches) * 100 if total_zone_pitches > 0 else 0
+                        regions[f"{v_pos} {h_pos}"] = {
+                            'count': region_pitches,
+                            'percentage': region_pct,
+                            'boundaries': (region_left, region_right, region_bottom, region_top)
+                        }
+                        
+                        # Add subtle region labels for the densest regions
+                        if region_pct >= 10:
+                            center_x = region_left + h_third/2
+                            center_y = region_bottom + v_third/2
+                            ax.text(center_x, center_y, f"{region_pct:.0f}%", 
+                                  ha='center', va='center', alpha=0.7, fontsize=9)
+            
+            return regions
+        
+        # Draw bad game location heatmap
+        bad_regions = draw_location_heatmap(ax1, self.bad_game_data, 'Bad Start Pitch Location')
+        
+        # Draw good games location heatmap
+        good_regions = draw_location_heatmap(ax2, self.good_games_data, 'Good Starts Pitch Location')
+        
+        # Add legend to one of the plots
+        handles, labels = ax1.get_legend_handles_labels()
+        fig.legend(handles, labels, loc='upper center', bbox_to_anchor=(0.5, 0.05), ncol=3)
+        
+        # Adding a main title
+        fig.suptitle(f"{self.pitcher['fullName']} - Pitch Location Comparison", 
+                    fontsize=16, fontweight='bold', y=0.98)
+        
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9, bottom=0.15)
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_location_comparison.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved location comparison to {fig_path}")
+        
+        # Create a more detailed location analysis
+        self.create_detailed_location_analysis(bad_regions, good_regions)
+        
+        return {
+            'figure': fig,
+            'bad_regions': bad_regions,
+            'good_regions': good_regions
+        }
+    
+    def create_detailed_location_analysis(self, bad_regions, good_regions):
+        """Create a more detailed analysis of location differences"""
+        if not bad_regions or not good_regions:
+            return None
+        
+        # Create a new figure for the region comparison
+        fig, ax = plt.subplots(figsize=(12, 9))
+        
+        # Create strike zone
+        zone_width = 1.7
+        zone_height = 2.0
+        zone_left = -zone_width/2
+        zone_right = zone_width/2
+        zone_bottom = 1.5
+        zone_top = zone_bottom + zone_height
+        
+        # Draw strike zone outline
+        ax.plot([zone_left, zone_right, zone_right, zone_left, zone_left],
+               [zone_bottom, zone_bottom, zone_top, zone_top, zone_bottom],
+               'k-', lw=2)
+        
+        # Define colors for the heatmap
+        diff_cmap = plt.cm.RdBu_r
+        
+        # Calculate the percentage differences for visualization
+        for region_name, region_data in bad_regions.items():
+            # Get region boundaries
+            left, right, bottom, top = region_data['boundaries']
+            
+            # Calculate the difference in pitch percentage
+            bad_pct = region_data['percentage']
+            good_pct = good_regions.get(region_name, {'percentage': 0})['percentage']
+            diff_pct = bad_pct - good_pct
+            
+            # Determine color based on difference
+            # Normalize to -20 to +20 for color scale
+            norm_diff = max(-20, min(20, diff_pct)) / 20  # Clamp to -1 to 1
+            
+            # Red for more in bad games, blue for more in good games
+            if diff_pct > 0:
+                color = diff_cmap(0.5 + norm_diff/2)  # Map 0 to 1 to 0.5 to 1.0
+            else:
+                color = diff_cmap(0.5 + norm_diff/2)  # Map -1 to 0 to 0.0 to 0.5
+            
+            # Create rectangle patch
+            rect = Rectangle((left, bottom), right-left, top-bottom, 
+                           facecolor=color, alpha=0.6, edgecolor='gray', linewidth=1)
+            ax.add_patch(rect)
+            
+            # Add text showing the difference
+            if abs(diff_pct) >= 2:  # Only label significant differences
+                center_x = left + (right - left)/2
+                center_y = bottom + (top - bottom)/2
+                
+                # Format string with appropriate sign
+                if diff_pct > 0:
+                    diff_str = f"+{diff_pct:.1f}%"
+                    text_color = 'darkred'
+                else:
+                    diff_str = f"{diff_pct:.1f}%"
+                    text_color = 'darkblue'
+                
+                ax.text(center_x, center_y, diff_str, 
+                       ha='center', va='center', 
+                       color=text_color, fontweight='bold', fontsize=9)
+        
+        # Add coloring explanation
+        explanation = """Red regions: More pitches in bad start
+Blue regions: More pitches in good starts
+Numbers show percentage point differences"""
+        
+        ax.text(0, 5.5, explanation, ha='center', va='center', 
+               bbox=dict(facecolor='white', alpha=0.9, boxstyle='round,pad=0.5'),
+               fontsize=10)
+        
+        # Create a custom colorbar
+        sm = plt.cm.ScalarMappable(cmap=diff_cmap, norm=plt.Normalize(-20, 20))
+        sm.set_array([])
+        cbar = plt.colorbar(sm, ax=ax, orientation='horizontal', pad=0.05, aspect=40)
+        cbar.set_label('Difference in Percentage Points (Bad - Good)', fontsize=10)
+        cbar.set_ticks([-20, -10, 0, 10, 20])
+        
+        # Set plot properties
+        ax.set_xlim(-3, 3)
+        ax.set_ylim(0, 6)
+        ax.set_xlabel('Horizontal Location (ft)')
+        ax.set_ylabel('Vertical Location (ft)')
+        
+        # Add catcher perspective labels
+        ax.text(2.5, 2.5, "Catcher's Perspective", rotation=90, fontsize=12)
+        ax.text(-2.5, 0.5, "RHH", fontsize=10)
+        ax.text(2.5, 0.5, "LHH", fontsize=10)
+        
+        # Add title
+        ax.set_title('Pitch Location Difference: Bad Start vs. Good Starts', fontsize=14, fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_location_diff_heatmap.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved location difference heatmap to {fig_path}")
+        
+        return fig
+    
+    def create_velocity_comparison(self):
+        """Create velocity comparison between bad start and good starts"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for velocity comparison")
+            return None
+        
+        # Calculate velocity by pitch type
+        pitch_velo_bad = {}
+        pitch_velo_good = {}
+        
+        # First filter to pitch types used in both datasets
+        common_pitches = set(self.bad_game_data['pitch_type'].unique()).intersection(
+            set(self.good_games_data['pitch_type'].unique()))
+        
+        for pitch_type in common_pitches:
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch_type]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch_type]
+            
+            if len(bad_pitch_data) >= 3 and len(good_pitch_data) >= 3:
+                pitch_velo_bad[pitch_type] = {
+                    'mean': bad_pitch_data['velocity'].mean(),
+                    'max': bad_pitch_data['velocity'].max(),
+                    'min': bad_pitch_data['velocity'].min(),
+                    'std': bad_pitch_data['velocity'].std(),
+                    'count': len(bad_pitch_data)
+                }
+                
+                pitch_velo_good[pitch_type] = {
+                    'mean': good_pitch_data['velocity'].mean(),
+                    'max': good_pitch_data['velocity'].max(),
+                    'min': good_pitch_data['velocity'].min(),
+                    'std': good_pitch_data['velocity'].std(),
+                    'count': len(good_pitch_data)
+                }
+        
+        if not pitch_velo_bad or not pitch_velo_good:
+            print("Insufficient data for velocity comparison")
+            return None
+        
+        # Create a figure
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Set up data for plotting
+        pitches = list(pitch_velo_bad.keys())
+        x = np.arange(len(pitches))
+        width = 0.35
+        
+        # Extract velocity data
+        bad_means = [pitch_velo_bad[p]['mean'] for p in pitches]
+        good_means = [pitch_velo_good[p]['mean'] for p in pitches]
+        bad_stds = [pitch_velo_bad[p]['std'] for p in pitches]
+        good_stds = [pitch_velo_good[p]['std'] for p in pitches]
+        
+        # Plot bars
+        bars1 = ax.bar(x - width/2, bad_means, width, yerr=bad_stds, label='Bad Start', color='#ff6b6b', capsize=5)
+        bars2 = ax.bar(x + width/2, good_means, width, yerr=good_stds, label='Good Starts', color='#4ecdc4', capsize=5)
+        
+        # Add labels and title
+        ax.set_ylabel('Velocity (mph)')
+        ax.set_title('Pitch Velocity Comparison: Bad Start vs. Good Starts', fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        
+        # Create labels with both pitch code and full name
+        pitch_labels = [f"{pitch}\n({self.get_full_pitch_name(pitch)})" for pitch in pitches]
+        ax.set_xticklabels(pitch_labels)
+        
+        # Add a horizontal grid for easier reading
+        ax.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax.legend()
+        
+        # Add value labels on the bars
+        def add_labels(bars, values):
+            for bar, value in zip(bars, values):
+                height = bar.get_height()
+                ax.annotate(f'{value:.1f}',
+                           xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3),  # 3 points vertical offset
+                           textcoords="offset points",
+                           ha='center', va='bottom')
+        
+        add_labels(bars1, bad_means)
+        add_labels(bars2, good_means)
+        
+        # Calculate and display velocity differences
+        for i, pitch in enumerate(pitches):
+            bad_velo = pitch_velo_bad[pitch]['mean']
+            good_velo = pitch_velo_good[pitch]['mean']
+            diff = bad_velo - good_velo
+            
+            if abs(diff) >= 0.5:  # Only show meaningful differences
+                diff_color = 'green' if diff > 0 else 'red'
+                y_pos = max(bad_velo, good_velo) + max(pitch_velo_bad[pitch]['std'], pitch_velo_good[pitch]['std']) + 0.5
+                ax.annotate(f"{diff:+.1f} mph", 
+                           xy=(i, y_pos),
+                           xytext=(0, 5),
+                           textcoords="offset points",
+                           ha='center',
+                           va='bottom',
+                           color=diff_color,
+                           fontweight='bold')
+        
+        # Customize y-axis range
+        min_velo = min([min(bad_means), min(good_means)]) - 2
+        max_velo = max([max(bad_means), max(good_means)]) + 3
+        ax.set_ylim(min_velo, max_velo)
+        
+        plt.tight_layout()
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_velocity_comparison.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved velocity comparison to {fig_path}")
+        
+        # Create a secondary plot showing velocity trends within the games
+        self.create_velocity_trend_analysis()
+        
+        return {
+            'figure': fig,
+            'bad_data': pitch_velo_bad,
+            'good_data': pitch_velo_good
+        }
+
+    def create_velocity_trend_analysis(self):
+        """Analyze velocity trends within games"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            return None
+        
+        # Get the primary fastball type (FF or FT or SI)
+        fastball_types = ['FF', 'FT', 'SI', 'FA']
+        primary_fb = None
+        
+        for fb_type in fastball_types:
+            if fb_type in self.bad_game_data['pitch_type'].values:
+                primary_fb = fb_type
+                break
+        
+        if primary_fb is None:
+            print("No fastball type found for velocity trend analysis")
+            return None
+        
+        # Filter to just fastballs and remove rows with missing velocity
+        bad_fb = self.bad_game_data[self.bad_game_data['pitch_type'] == primary_fb]
+        bad_fb = bad_fb[~bad_fb['velocity'].isna() & ~bad_fb['pitch_number'].isna()]
+        
+        good_fb = self.good_games_data[self.good_games_data['pitch_type'] == primary_fb]
+        good_fb = good_fb[~good_fb['velocity'].isna() & ~good_fb['pitch_number'].isna()]
+        
+        if len(bad_fb) < 5 or len(good_fb) < 5:
+            print("Insufficient fastball data for trend analysis")
+            return None
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Get game identifiers for labels
+        bad_game_date = self.bad_game_date.strftime('%Y-%m-%d')
+        bad_game_opponent = self.bad_game_metrics['opponent']
+        
+        good_game_date = self.good_game_date.strftime('%Y-%m-%d')
+        good_game_opponent = self.good_game_metrics['opponent']
+        
+        # Plot bad game velocity trend
+        ax.scatter(bad_fb['pitch_number'], bad_fb['velocity'], color='red', 
+                 label=f'Bad Start: {bad_game_date} vs {bad_game_opponent}', alpha=0.7, s=80)
+        
+        # Fit a trend line for bad game
+        try:
+            z = np.polyfit(bad_fb['pitch_number'], bad_fb['velocity'], 1)
+            p = np.poly1d(z)
+            ax.plot(bad_fb['pitch_number'], p(bad_fb['pitch_number']), "r--", 
+                   label=f'Bad Start Trend (Slope: {z[0]:.4f})')
+        except Exception as e:
+            print(f"Error fitting trend line for bad game: {e}")
+        
+        # Plot good game velocity data
+        try:
+            # Plot good game data points
+            ax.scatter(good_fb['pitch_number'], good_fb['velocity'], 
+                      color='#4ecdc4', alpha=0.7, s=80,
+                      label=f'Good Start: {good_game_date} vs {good_game_opponent}')
+            
+            # Fit good game trend line if enough points
+            if len(good_fb) >= 5:
+                try:
+                    z = np.polyfit(good_fb['pitch_number'], good_fb['velocity'], 1)
+                    p = np.poly1d(z)
+                    ax.plot(good_fb['pitch_number'], p(good_fb['pitch_number']), "--", 
+                           color='#4ecdc4', alpha=0.7, 
+                           label=f'Good Start Trend (Slope: {z[0]:.4f})')
+                except Exception as e:
+                    print(f"Error fitting trend line for good game: {e}")
+        except Exception as e:
+            print(f"Error plotting good game data: {e}")
+            
+        # Set chart properties
+        ax.set_xlabel('Pitch Number')
+        ax.set_ylabel(f'{primary_fb} Velocity (mph)')
+        ax.set_title(f'Fastball Velocity Trend Comparison', fontsize=14, fontweight='bold')
+        
+        # Add grid for readability
+        ax.grid(True, linestyle='--', alpha=0.3)
+        
+        # Add horizontal lines at starting velocities
+        if not bad_fb.empty:
+            bad_start_velo = bad_fb.iloc[0]['velocity']
+            ax.axhline(y=bad_start_velo, color='red', linestyle='-', alpha=0.3)
+            ax.text(5, bad_start_velo + 0.2, f'Bad Start: {bad_start_velo:.1f} mph', 
+                   fontsize=9, color='red')
+        
+        if not good_fb.empty:
+            good_start_velo = good_fb.iloc[0]['velocity']
+            ax.axhline(y=good_start_velo, color='#4ecdc4', linestyle='-', alpha=0.3)
+            ax.text(5, good_start_velo + 0.2, f'Good Start: {good_start_velo:.1f} mph', 
+                   fontsize=9, color='#4ecdc4')
+        
+        # Customize the legend
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2)
+        
+        # Calculate fatigue metrics
+        bad_velo_drop = bad_fb.iloc[0]['velocity'] - bad_fb.iloc[-1]['velocity'] if len(bad_fb) > 1 else 0
+        good_velo_drop = good_fb.iloc[0]['velocity'] - good_fb.iloc[-1]['velocity'] if len(good_fb) > 1 else 0
+        
+        # Add annotations for velocity drop
+        if abs(bad_velo_drop) > 1.0:
+            ax.annotate(f'Bad Start Drop: {bad_velo_drop:.1f} mph',
+                       xy=(bad_fb.iloc[-1]['pitch_number'], bad_fb.iloc[-1]['velocity']),
+                       xytext=(0, -30),
+                       textcoords='offset points',
+                       arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'),
+                       color='red',
+                       fontweight='bold')
+        
+        if abs(good_velo_drop) > 1.0:
+            ax.annotate(f'Good Start Drop: {good_velo_drop:.1f} mph',
+                       xy=(good_fb.iloc[-1]['pitch_number'], good_fb.iloc[-1]['velocity']),
+                       xytext=(0, -30),
+                       textcoords='offset points',
+                       arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'),
+                       color='#4ecdc4',
+                       fontweight='bold')
+        
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.2)
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_velocity_trend.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved velocity trend analysis to {fig_path}")
+        
+        return fig        
+        # Set chart properties
+        ax.set_xlabel('Pitch Number')
+        ax.set_ylabel(f'{primary_fb} Velocity (mph)')
+        ax.set_title(f'Fastball Velocity Trend Comparison', fontsize=14, fontweight='bold')
+        
+        # Add grid for readability
+        ax.grid(True, linestyle='--', alpha=0.3)
+        
+        # Add horizontal line at starting velocity
+        if not bad_fb.empty:
+            start_velo = bad_fb.iloc[0]['velocity']
+            ax.axhline(y=start_velo, color='gray', linestyle='-', alpha=0.3)
+            ax.text(5, start_velo + 0.2, f'Starting Velocity: {start_velo:.1f} mph', 
+                   fontsize=9, color='gray')
+        
+        # Customize the legend
+        ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3)
+        
+        # Calculate fatigue metrics
+        bad_velo_drop = bad_fb.iloc[0]['velocity'] - bad_fb.iloc[-1]['velocity'] if len(bad_fb) > 1 else 0
+        
+        # Add annotations for velocity drop
+        if bad_velo_drop > 1.0:
+            ax.annotate(f'Velocity Drop: {bad_velo_drop:.1f} mph',
+                       xy=(bad_fb.iloc[-1]['pitch_number'], bad_fb.iloc[-1]['velocity']),
+                       xytext=(0, -30),
+                       textcoords='offset points',
+                       arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=.2'),
+                       color='red',
+                       fontweight='bold')
+        
+        plt.tight_layout()
+        plt.subplots_adjust(bottom=0.2)
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_velocity_trend.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved velocity trend analysis to {fig_path}")
+        
+        return fig
+    
+    def create_spin_rate_comparison(self):
+        """Create spin rate comparison between bad start and good starts"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for spin rate comparison")
+            return None
+        
+        # Check if spin rate data is available
+        if 'spin_rate' not in self.bad_game_data.columns or 'spin_rate' not in self.good_games_data.columns:
+            print("Spin rate data not available")
+            return None
+        
+        # Calculate spin rate by pitch type
+        pitch_spin_bad = {}
+        pitch_spin_good = {}
+        
+        # First filter to pitch types used in both datasets
+        common_pitches = set(self.bad_game_data['pitch_type'].unique()).intersection(
+            set(self.good_games_data['pitch_type'].unique()))
+        
+        for pitch_type in common_pitches:
+            # Get data for this pitch type
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch_type]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch_type]
+            
+            # Filter out missing spin rate data
+            bad_pitch_data = bad_pitch_data[~bad_pitch_data['spin_rate'].isna()]
+            good_pitch_data = good_pitch_data[~good_pitch_data['spin_rate'].isna()]
+            
+            if len(bad_pitch_data) >= 3 and len(good_pitch_data) >= 3:
+                # Only include if we have enough data points
+                try:
+                    pitch_spin_bad[pitch_type] = {
+                        'mean': bad_pitch_data['spin_rate'].mean(),
+                        'max': bad_pitch_data['spin_rate'].max(),
+                        'min': bad_pitch_data['spin_rate'].min(),
+                        'std': bad_pitch_data['spin_rate'].std(),
+                        'count': len(bad_pitch_data)
+                    }
+                    
+                    pitch_spin_good[pitch_type] = {
+                        'mean': good_pitch_data['spin_rate'].mean(),
+                        'max': good_pitch_data['spin_rate'].max(),
+                        'min': good_pitch_data['spin_rate'].min(),
+                        'std': good_pitch_data['spin_rate'].std(),
+                        'count': len(good_pitch_data)
+                    }
+                except Exception as e:
+                    print(f"Error calculating spin rate stats for {pitch_type}: {e}")
+                    continue
+        
+        if not pitch_spin_bad or not pitch_spin_good:
+            print("Insufficient data for spin rate comparison")
+            return None
+        
+        # Create a figure
+        fig, ax = plt.subplots(figsize=(12, 8))
+        
+        # Set up data for plotting
+        pitches = list(pitch_spin_bad.keys())
+        x = np.arange(len(pitches))
+        width = 0.35
+        
+        # Extract spin rate data
+        bad_means = [pitch_spin_bad[p]['mean'] for p in pitches]
+        good_means = [pitch_spin_good[p]['mean'] for p in pitches]
+        bad_stds = [pitch_spin_bad[p]['std'] for p in pitches]
+        good_stds = [pitch_spin_good[p]['std'] for p in pitches]
+        
+        # Plot bars
+        bars1 = ax.bar(x - width/2, bad_means, width, yerr=bad_stds, label='Bad Start', color='#ff6b6b', capsize=5)
+        bars2 = ax.bar(x + width/2, good_means, width, yerr=good_stds, label='Good Starts', color='#4ecdc4', capsize=5)
+        
+        # Add labels and title
+        ax.set_ylabel('Spin Rate (RPM)')
+        ax.set_title('Pitch Spin Rate Comparison: Bad Start vs. Good Starts', fontsize=14, fontweight='bold')
+        ax.set_xticks(x)
+        
+        # Create labels with both pitch code and full name
+        pitch_labels = [f"{pitch}\n({self.get_full_pitch_name(pitch)})" for pitch in pitches]
+        ax.set_xticklabels(pitch_labels)
+        
+        # Add a horizontal grid for easier reading
+        ax.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax.legend()
+        
+        # Add value labels on the bars
+        def add_labels(bars, values):
+            for bar, value in zip(bars, values):
+                height = bar.get_height()
+                ax.annotate(f'{value:.0f}',
+                           xy=(bar.get_x() + bar.get_width() / 2, height),
+                           xytext=(0, 3),  # 3 points vertical offset
+                           textcoords="offset points",
+                           ha='center', va='bottom')
+        
+        add_labels(bars1, bad_means)
+        add_labels(bars2, good_means)
+        
+        # Calculate and display spin rate differences
+        for i, pitch in enumerate(pitches):
+            bad_spin = pitch_spin_bad[pitch]['mean']
+            good_spin = pitch_spin_good[pitch]['mean']
+            diff = bad_spin - good_spin
+            diff_pct = (diff / good_spin) * 100
+            
+            if abs(diff) >= 50:  # Only show meaningful differences
+                diff_color = 'green' if diff > 0 else 'red'
+                y_pos = max(bad_spin, good_spin) + max(pitch_spin_bad[pitch]['std'], pitch_spin_good[pitch]['std']) + 50
+                ax.annotate(f"{diff:+.0f} RPM ({diff_pct:+.1f}%)", 
+                           xy=(i, y_pos),
+                           xytext=(0, 5),
+                           textcoords="offset points",
+                           ha='center',
+                           va='bottom',
+                           color=diff_color,
+                           fontweight='bold')
+        
+        plt.tight_layout()
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_spin_rate_comparison.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved spin rate comparison to {fig_path}")
+        
+        return {
+            'figure': fig,
+            'bad_data': pitch_spin_bad,
+            'good_data': pitch_spin_good
+        }
+    
+    def create_outcome_analysis(self):
+        """Create analysis of pitch outcomes between bad start and good starts"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for outcome analysis")
+            return None
+        
+        # Calculate overall outcomes
+        bad_outcomes = {
+            'good': sum(self.bad_game_data['pitch_result'] == 'good'),
+            'bad': sum(self.bad_game_data['pitch_result'] == 'bad'),
+            'neutral': sum(self.bad_game_data['pitch_result'] == 'neutral'),
+            'total': len(self.bad_game_data)
+        }
+        
+        good_outcomes = {
+            'good': sum(self.good_games_data['pitch_result'] == 'good'),
+            'bad': sum(self.good_games_data['pitch_result'] == 'bad'),
+            'neutral': sum(self.good_games_data['pitch_result'] == 'neutral'),
+            'total': len(self.good_games_data)
+        }
+        
+        # Calculate outcome percentages
+        bad_percentages = {
+            'good': (bad_outcomes['good'] / bad_outcomes['total']) * 100,
+            'bad': (bad_outcomes['bad'] / bad_outcomes['total']) * 100,
+            'neutral': (bad_outcomes['neutral'] / bad_outcomes['total']) * 100
+        }
+        
+        good_percentages = {
+            'good': (good_outcomes['good'] / good_outcomes['total']) * 100,
+            'bad': (good_outcomes['bad'] / good_outcomes['total']) * 100,
+            'neutral': (good_outcomes['neutral'] / good_outcomes['total']) * 100
+        }
+        
+        # Calculate strike/ball percentages
+        bad_strike_pct = (sum(self.bad_game_data['strike_ball'] == 'strike') / bad_outcomes['total']) * 100
+        good_strike_pct = (sum(self.good_games_data['strike_ball'] == 'strike') / good_outcomes['total']) * 100
+        
+        # Create figure with 2 rows and 2 columns
+        fig = plt.figure(figsize=(14, 12))
+        gs = gridspec.GridSpec(2, 2, figure=fig)
+        
+        # Create pie charts for outcomes
+        ax1 = fig.add_subplot(gs[0, 0])
+        ax2 = fig.add_subplot(gs[0, 1])
+        
+        # Plot outcome pie charts
+        def plot_outcome_pie(ax, data, title):
+            labels = ['Good Results', 'Bad Results', 'Neutral']
+            sizes = [data['good'], data['bad'], data['neutral']]
+            colors = ['#4ecdc4', '#ff6b6b', '#f9f9f9']
+            explode = (0.1, 0.1, 0)
+            
+            wedges, texts, autotexts = ax.pie(sizes, explode=explode, labels=labels, colors=colors,
+                                             autopct='%1.1f%%', shadow=False, startangle=90)
+            
+            # Set label colors
+            for text in texts:
+                text.set_color('black')
+            for autotext in autotexts:
+                autotext.set_color('white')
+                autotext.set_fontweight('bold')
+            
+            ax.set_title(title, fontsize=14, fontweight='bold')
+            
+            # Add pitch count to title
+            ax.text(0, -1.2, f"Total Pitches: {sum(sizes)}", ha='center', fontsize=10)
+            
+            return sizes
+        
+        bad_sizes = plot_outcome_pie(ax1, bad_percentages, 'Bad Start Pitch Outcomes')
+        good_sizes = plot_outcome_pie(ax2, good_percentages, 'Good Starts Pitch Outcomes')
+        
+        # Create bar chart for strike percentage
+        ax3 = fig.add_subplot(gs[1, 0])
+        
+        x = np.arange(2)
+        width = 0.35
+        
+        bars = ax3.bar(x, [bad_strike_pct, good_strike_pct], width, color=['#ff6b6b', '#4ecdc4'])
+        
+        ax3.set_ylabel('Strike Percentage')
+        ax3.set_title('Strike Percentage Comparison', fontsize=14, fontweight='bold')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels(['Bad Start', 'Good Starts'])
+        ax3.set_ylim(0, 100)
+        
+        # Add value labels
+        for bar in bars:
+            height = bar.get_height()
+            ax3.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        # Add a highlight for the difference
+        diff = bad_strike_pct - good_strike_pct
+        diff_text = f"Difference: {diff:+.1f}%"
+        diff_color = 'red' if diff < 0 else 'green'
+        ax3.text(0.5, 80, diff_text, ha='center', color=diff_color, fontweight='bold')
+        
+        # Create bar chart for pitch type effectiveness
+        ax4 = fig.add_subplot(gs[1, 1])
+        
+        # Calculate effectiveness by pitch type
+        effectiveness_data = []
+        
+        # Get common pitch types
+        common_pitches = set(self.bad_game_data['pitch_type'].unique()).intersection(
+            set(self.good_games_data['pitch_type'].unique()))
+        
+        for pitch in common_pitches:
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch]
+            
+            if len(bad_pitch_data) >= 5 and len(good_pitch_data) >= 5:
+                # Calculate success ratios (good results / total results with outcome)
+                bad_good = sum(bad_pitch_data['pitch_result'] == 'good')
+                bad_bad = sum(bad_pitch_data['pitch_result'] == 'bad')
+                bad_total = bad_good + bad_bad
+                
+                good_good = sum(good_pitch_data['pitch_result'] == 'good')
+                good_bad = sum(good_pitch_data['pitch_result'] == 'bad')
+                good_total = good_good + good_bad
+                
+                if bad_total > 0 and good_total > 0:
+                    bad_ratio = (bad_good / bad_total) * 100
+                    good_ratio = (good_good / good_total) * 100
+                    
+                    effectiveness_data.append({
+                        'pitch': pitch,
+                        'name': self.get_full_pitch_name(pitch),
+                        'bad_ratio': bad_ratio,
+                        'good_ratio': good_ratio,
+                        'diff': bad_ratio - good_ratio,
+                        'bad_count': len(bad_pitch_data),
+                        'good_count': len(good_pitch_data)
+                    })
+        
+        if effectiveness_data:
+            # Sort by absolute difference
+            effectiveness_data.sort(key=lambda x: abs(x['diff']), reverse=True)
+            
+            # Select top 5 pitches with biggest differences
+            top_pitches = effectiveness_data[:5]
+            
+            x = np.arange(len(top_pitches))
+            width = 0.35
+            
+            # Extract data
+            pitches = [p['pitch'] for p in top_pitches]
+            bad_ratios = [p['bad_ratio'] for p in top_pitches]
+            good_ratios = [p['good_ratio'] for p in top_pitches]
+            
+            # Plot bars
+            bars1 = ax4.bar(x - width/2, bad_ratios, width, label='Bad Start', color='#ff6b6b')
+            bars2 = ax4.bar(x + width/2, good_ratios, width, label='Good Starts', color='#4ecdc4')
+            
+            # Add labels
+            ax4.set_ylabel('Success Ratio (%)')
+            ax4.set_title('Pitch Type Effectiveness Comparison', fontsize=14, fontweight='bold')
+            ax4.set_xticks(x)
+            
+            # Create readable labels
+            pitch_labels = [f"{p['pitch']}\n({p['name']})" for p in top_pitches]
+            ax4.set_xticklabels(pitch_labels)
+            
+            # Add a grid
+            ax4.yaxis.grid(True, linestyle='--', alpha=0.7)
+            
+            # Add legend
+            ax4.legend()
+            
+            # Add value labels
+            for i, (bar1, bar2) in enumerate(zip(bars1, bars2)):
+                height1 = bar1.get_height()
+                height2 = bar2.get_height()
+                
+                ax4.annotate(f'{height1:.1f}%',
+                           xy=(bar1.get_x() + bar1.get_width() / 2, height1),
+                           xytext=(0, 3),
+                           textcoords="offset points",
+                           ha='center', va='bottom')
+                
+                ax4.annotate(f'{height2:.1f}%',
+                           xy=(bar2.get_x() + bar2.get_width() / 2, height2),
+                           xytext=(0, 3),
+                           textcoords="offset points",
+                           ha='center', va='bottom')
+                
+                # Add difference annotation
+                diff = top_pitches[i]['diff']
+                y_pos = max(height1, height2) + 5
+                diff_text = f"{diff:+.1f}%"
+                diff_color = 'green' if diff > 0 else 'red'
+                
+                ax4.annotate(diff_text,
+                           xy=(i, y_pos),
+                           xytext=(0, 5),
+                           textcoords="offset points",
+                           ha='center',
+                           color=diff_color,
+                           fontweight='bold')
+            
+            # Set y-axis limits
+            ax4.set_ylim(0, 100)
+        
+        # Add a main title
+        fig.suptitle(f"{self.pitcher['fullName']} - Pitch Outcome Analysis", 
+                    fontsize=16, fontweight='bold', y=0.98)
+        
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_outcome_analysis.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved outcome analysis to {fig_path}")
+        
+        return {
+            'figure': fig,
+            'bad_outcomes': bad_outcomes,
+            'good_outcomes': good_outcomes,
+            'effectiveness_data': effectiveness_data if effectiveness_data else None
+        }
+    
+    def create_count_analysis(self):
+        """Analyze performance by count situation"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for count analysis")
+            return None
+        
+        # Define count categories
+        hitter_counts = ['2-0', '3-0', '3-1', '2-1']
+        pitcher_counts = ['0-1', '0-2', '1-2', '2-2']
+        neutral_counts = ['0-0', '1-0', '1-1', '3-2']
+        
+        # Function to categorize counts
+        def categorize_counts(data):
+            data_copy = data.copy()
+            data_copy['count_category'] = 'other'
+            data_copy.loc[data_copy['count'].isin(hitter_counts), 'count_category'] = 'hitter'
+            data_copy.loc[data_copy['count'].isin(pitcher_counts), 'count_category'] = 'pitcher'
+            data_copy.loc[data_copy['count'].isin(neutral_counts), 'count_category'] = 'neutral'
+            return data_copy
+        
+        # Add count categories
+        bad_data = categorize_counts(self.bad_game_data)
+        good_data = categorize_counts(self.good_games_data)
+        
+        # Calculate count distributions
+        bad_count_dist = bad_data['count_category'].value_counts(normalize=True) * 100
+        good_count_dist = good_data['count_category'].value_counts(normalize=True) * 100
+        
+        # Calculate success rates in different count situations
+        bad_count_success = {}
+        good_count_success = {}
+        
+        for category in ['hitter', 'pitcher', 'neutral']:
+            # Bad game
+            bad_cat_data = bad_data[bad_data['count_category'] == category]
+            if len(bad_cat_data) > 0:
+                bad_good = sum(bad_cat_data['pitch_result'] == 'good')
+                bad_bad = sum(bad_cat_data['pitch_result'] == 'bad')
+                bad_total = bad_good + bad_bad
+                
+                if bad_total > 0:
+                    bad_count_success[category] = (bad_good / bad_total) * 100
+                else:
+                    bad_count_success[category] = 0
+            else:
+                bad_count_success[category] = 0
+            
+            # Good games
+            good_cat_data = good_data[good_data['count_category'] == category]
+            if len(good_cat_data) > 0:
+                good_good = sum(good_cat_data['pitch_result'] == 'good')
+                good_bad = sum(good_cat_data['pitch_result'] == 'bad')
+                good_total = good_good + good_bad
+                
+                if good_total > 0:
+                    good_count_success[category] = (good_good / good_total) * 100
+                else:
+                    good_count_success[category] = 0
+            else:
+                good_count_success[category] = 0
+        
+        # Create figure with 1 row and 2 columns
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 8))
+        
+        # Plot count distribution
+        categories = ['hitter', 'pitcher', 'neutral', 'other']
+        
+        # Prepare data
+        bad_pcts = [bad_count_dist.get(cat, 0) for cat in categories]
+        good_pcts = [good_count_dist.get(cat, 0) for cat in categories]
+        
+        x = np.arange(len(categories))
+        width = 0.35
+        
+        # Plot bars
+        bars1 = ax1.bar(x - width/2, bad_pcts, width, label='Bad Start', color='#ff6b6b')
+        bars2 = ax1.bar(x + width/2, good_pcts, width, label='Good Starts', color='#4ecdc4')
+        
+        # Add labels
+        ax1.set_ylabel('Percentage of Pitches')
+        ax1.set_title('Count Distribution', fontsize=14, fontweight='bold')
+        ax1.set_xticks(x)
+        
+        # Create more readable labels
+        category_labels = ['Hitter Counts', 'Pitcher Counts', 'Neutral Counts', 'Other']
+        ax1.set_xticklabels(category_labels)
+        
+        # Add a grid
+        ax1.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax1.legend()
+        
+        # Add value labels
+        for bar in bars1:
+            height = bar.get_height()
+            ax1.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        for bar in bars2:
+            height = bar.get_height()
+            ax1.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        # Plot success rates in different count situations
+        categories = ['hitter', 'pitcher', 'neutral']
+        
+        # Prepare data
+        bad_success = [bad_count_success.get(cat, 0) for cat in categories]
+        good_success = [good_count_success.get(cat, 0) for cat in categories]
+        
+        x = np.arange(len(categories))
+        width = 0.35
+        
+        # Plot bars
+        bars3 = ax2.bar(x - width/2, bad_success, width, label='Bad Start', color='#ff6b6b')
+        bars4 = ax2.bar(x + width/2, good_success, width, label='Good Starts', color='#4ecdc4')
+        
+        # Add labels
+        ax2.set_ylabel('Success Rate (%)')
+        ax2.set_title('Success Rate by Count Type', fontsize=14, fontweight='bold')
+        ax2.set_xticks(x)
+        
+        # Create more readable labels
+        category_labels = ['Hitter Counts', 'Pitcher Counts', 'Neutral Counts']
+        ax2.set_xticklabels(category_labels)
+        
+        # Add a grid
+        ax2.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax2.legend()
+        
+        # Add value labels
+        for bar in bars3:
+            height = bar.get_height()
+            ax2.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        for bar in bars4:
+            height = bar.get_height()
+            ax2.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        # Calculate and display differences
+        for i, category in enumerate(categories):
+            bad_pct = bad_success[i]
+            good_pct = good_success[i]
+            diff = bad_pct - good_pct
+            
+            if abs(diff) >= 5:  # Only show meaningful differences
+                diff_color = 'green' if diff > 0 else 'red'
+                y_pos = max(bad_pct, good_pct) + 5
+                ax2.annotate(f"{diff:+.1f}%", 
+                           xy=(i, y_pos),
+                           xytext=(0, 5),
+                           textcoords="offset points",
+                           ha='center',
+                           color=diff_color,
+                           fontweight='bold')
+        
+        # Set consistent y-axis limits
+        ax1.set_ylim(0, 60)
+        ax2.set_ylim(0, 80)
+        
+        # Add a main title
+        fig.suptitle(f"{self.pitcher['fullName']} - Analysis by Count", 
+                    fontsize=16, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_count_analysis.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved count analysis to {fig_path}")
+        
+        return {
+            'figure': fig,
+            'bad_count_dist': bad_count_dist,
+            'good_count_dist': good_count_dist,
+            'bad_count_success': bad_count_success,
+            'good_count_success': good_count_success
+        }
+
+    def analyze_opposing_batters(self):
+        """Analyze performance against RH vs LH batters and by batter quality"""
+        if self.bad_game_data is None or self.good_games_data is None:
+            print("Missing game data for batter analysis")
+            return None
+        
+        # Analyze performance by batter handedness
+        def analyze_by_handedness(data):
+            rh_batters = data[data['stand'] == 'R']
+            lh_batters = data[data['stand'] == 'L']
+            
+            results = {
+                'RHB': {
+                    'total': len(rh_batters),
+                    'good': sum(rh_batters['pitch_result'] == 'good'),
+                    'bad': sum(rh_batters['pitch_result'] == 'bad'),
+                    'strike_pct': (sum(rh_batters['strike_ball'] == 'strike') / len(rh_batters)) * 100 if len(rh_batters) > 0 else 0
+                },
+                'LHB': {
+                    'total': len(lh_batters),
+                    'good': sum(lh_batters['pitch_result'] == 'good'),
+                    'bad': sum(lh_batters['pitch_result'] == 'bad'),
+                    'strike_pct': (sum(lh_batters['strike_ball'] == 'strike') / len(lh_batters)) * 100 if len(lh_batters) > 0 else 0
+                }
+            }
+            
+            # Calculate success ratios
+            for hand in ['RHB', 'LHB']:
+                if results[hand]['good'] + results[hand]['bad'] > 0:
+                    results[hand]['success_ratio'] = (results[hand]['good'] / 
+                                                    (results[hand]['good'] + results[hand]['bad'])) * 100
+                else:
+                    results[hand]['success_ratio'] = 0
+            
+            return results
+        
+        bad_batter_results = analyze_by_handedness(self.bad_game_data)
+        good_batter_results = analyze_by_handedness(self.good_games_data)
+        
+        # Create figure
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 8))
+        
+        # Plot strike percentage by batter handedness
+        hands = ['RHB', 'LHB']
+        
+        # Strike percentage data
+        bad_strike_pct = [bad_batter_results[hand]['strike_pct'] for hand in hands]
+        good_strike_pct = [good_batter_results[hand]['strike_pct'] for hand in hands]
+        
+        x = np.arange(len(hands))
+        width = 0.35
+        
+        # Plot bars
+        bars1 = ax1.bar(x - width/2, bad_strike_pct, width, label='Bad Start', color='#ff6b6b')
+        bars2 = ax1.bar(x + width/2, good_strike_pct, width, label='Good Starts', color='#4ecdc4')
+        
+        # Add labels
+        ax1.set_ylabel('Strike Percentage')
+        ax1.set_title('Strike Percentage by Batter Handedness', fontsize=14, fontweight='bold')
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(hands)
+        
+        # Add a grid
+        ax1.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax1.legend()
+        
+        # Add value labels
+        for bar in bars1:
+            height = bar.get_height()
+            ax1.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        for bar in bars2:
+            height = bar.get_height()
+            ax1.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        # Set y-axis limits
+        ax1.set_ylim(0, 100)
+        
+        # Plot success ratio by batter handedness
+        bad_success = [bad_batter_results[hand]['success_ratio'] for hand in hands]
+        good_success = [good_batter_results[hand]['success_ratio'] for hand in hands]
+        
+        # Plot bars
+        bars3 = ax2.bar(x - width/2, bad_success, width, label='Bad Start', color='#ff6b6b')
+        bars4 = ax2.bar(x + width/2, good_success, width, label='Good Starts', color='#4ecdc4')
+        
+        # Add labels
+        ax2.set_ylabel('Success Ratio (%)')
+        ax2.set_title('Success Ratio by Batter Handedness', fontsize=14, fontweight='bold')
+        ax2.set_xticks(x)
+        ax2.set_xticklabels(hands)
+        
+        # Add a grid
+        ax2.yaxis.grid(True, linestyle='--', alpha=0.7)
+        
+        # Add legend
+        ax2.legend()
+        
+        # Add value labels
+        for bar in bars3:
+            height = bar.get_height()
+            ax2.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        for bar in bars4:
+            height = bar.get_height()
+            ax2.annotate(f'{height:.1f}%',
+                       xy=(bar.get_x() + bar.get_width() / 2, height),
+                       xytext=(0, 3),
+                       textcoords="offset points",
+                       ha='center', va='bottom')
+        
+        # Calculate and display differences
+        for i, hand in enumerate(hands):
+            # Strike percentage differences
+            strike_diff = bad_strike_pct[i] - good_strike_pct[i]
+            if abs(strike_diff) >= 5:
+                diff_color = 'green' if strike_diff > 0 else 'red'
+                y_pos = max(bad_strike_pct[i], good_strike_pct[i]) + 5
+                ax1.annotate(f"{strike_diff:+.1f}%", 
+                           xy=(i, y_pos),
+                           xytext=(0, 5),
+                           textcoords="offset points",
+                           ha='center',
+                           color=diff_color,
+                           fontweight='bold')
+            
+            # Success ratio differences
+            success_diff = bad_success[i] - good_success[i]
+            if abs(success_diff) >= 5:
+                diff_color = 'green' if success_diff > 0 else 'red'
+                y_pos = max(bad_success[i], good_success[i]) + 5
+                ax2.annotate(f"{success_diff:+.1f}%", 
+                           xy=(i, y_pos),
+                           xytext=(0, 5),
+                           textcoords="offset points",
+                           ha='center',
+                           color=diff_color,
+                           fontweight='bold')
+        
+        # Set consistent y-axis limits
+        ax2.set_ylim(0, 100)
+        
+        # Add a main title
+        fig.suptitle(f"{self.pitcher['fullName']} - Analysis by Batter Handedness", 
+                    fontsize=16, fontweight='bold')
+        
+        plt.tight_layout()
+        plt.subplots_adjust(top=0.9)
+        
+        # Save the figure
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            
+        fig_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_batter_analysis.png")
+        plt.savefig(fig_path, dpi=300, bbox_inches='tight')
+        print(f"Saved batter handedness analysis to {fig_path}")
+        
+        return {
+            'figure': fig,
+            'bad_results': bad_batter_results,
+            'good_results': good_batter_results
+        }
+    
+    def get_full_pitch_name(self, pitch_code):
+        """Convert pitch type code to full name"""
+        return self.pitch_type_map.get(pitch_code, pitch_code)
+    
+    def generate_performance_summary(self):
+        """Generate a comprehensive summary of why the bad start was bad compared to the good start"""
+        summary = []
+        
+        # Add title and basic information
+        bad_game_date_str = self.bad_game_date.strftime('%Y-%m-%d')
+        good_game_date_str = self.good_game_date.strftime('%Y-%m-%d')
+        pitcher_name = self.pitcher['fullName']
+        
+        # Get opponent information
+        bad_opponent = self.bad_game_metrics['opponent']
+        good_opponent = self.good_game_metrics['opponent']
+        
+        summary.append(f"# Performance Analysis: {pitcher_name}'s Start on {bad_game_date_str} vs {bad_opponent}")
+        summary.append(f"\n## Comparison with Good Start: {good_game_date_str} vs {good_opponent}")
+        
+        # Add a narrative overview for both starts
+        summary.append("\n## Game Narratives")
+        
+        # Get final stat lines for both starts
+        bad_ip = self.bad_game_metrics['innings_display']
+        bad_k = self.bad_game_metrics['strikeouts']
+        bad_bb = self.bad_game_metrics['walks']
+        bad_h = self.bad_game_metrics['hits']
+        bad_hr = self.bad_game_metrics['home_runs']
+        bad_score = self.bad_game_metrics['game_score']
+        
+        good_ip = self.good_game_metrics['innings_display']
+        good_k = self.good_game_metrics['strikeouts']
+        good_bb = self.good_game_metrics['walks']
+        good_h = self.good_game_metrics['hits']
+        good_hr = self.good_game_metrics['home_runs']
+        good_score = self.good_game_metrics['game_score']
+        
+        # Calculate pitch counts and strike percentages
+        bad_total = len(self.bad_game_data)
+        bad_strikes = sum(self.bad_game_data['strike_ball'] == 'strike')
+        bad_strike_pct = (bad_strikes / bad_total) * 100 if bad_total > 0 else 0
+        
+        good_total = len(self.good_games_data)
+        good_strikes = sum(self.good_games_data['strike_ball'] == 'strike')
+        good_strike_pct = (good_strikes / good_total) * 100 if good_total > 0 else 0
+        
+        # Calculate estimated runs allowed (used in GameScore calculation)
+        bad_er = bad_hr + 0.5 * (bad_h - bad_hr)
+        good_er = good_hr + 0.5 * (good_h - good_hr)
+        
+        # Add narrative for the bad start
+        summary.append("\n### The Struggle: " + bad_game_date_str + " vs " + bad_opponent)
+        summary.append(f"\n**Final Line:** {bad_ip} IP, {bad_k} K, {bad_bb} BB, {bad_h} H, {bad_hr} HR, ~{bad_er:.1f} ER ({bad_total} pitches, {bad_strike_pct:.1f}% strikes)")
+        
+        # Create a narrative description of the bad start
+        bad_start_narrative = []
+        
+        # Describe the overall performance
+        if bad_score < 30:
+            bad_start_narrative.append(f"{pitcher_name} had a particularly rough outing against {bad_opponent}, struggling with both command and results.")
+        elif bad_score < 40:
+            bad_start_narrative.append(f"{pitcher_name} delivered a below-average performance against {bad_opponent}, failing to find consistency.")
+        else:
+            bad_start_narrative.append(f"{pitcher_name}'s start against {bad_opponent} was mediocre, showing flashes but ultimately falling short.")
+        
+        # Describe command issues if applicable
+        if bad_strike_pct < 60:
+            bad_start_narrative.append(f"Command was a significant issue, with only {bad_strike_pct:.1f}% of pitches going for strikes.")
+        
+        # Describe hit/walk issues
+        if bad_h > 8 or bad_bb > 4 or bad_hr > 1:
+            issue_parts = []
+            if bad_h > 8:
+                issue_parts.append(f"allowing {bad_h} hits")
+            if bad_bb > 4:
+                issue_parts.append(f"issuing {bad_bb} walks")
+            if bad_hr > 1:
+                issue_parts.append(f"surrendering {bad_hr} home runs")
+            
+            if issue_parts:
+                bad_start_narrative.append("The pitcher struggled with " + ", ".join(issue_parts) + ".")
+        
+        # Get pitch mix issues
+        pitch_mix_bad = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        pitch_mix_good = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        pitch_mix_diffs = []
+        for pitch in set(pitch_mix_bad.index).union(set(pitch_mix_good.index)):
+            bad_pct = pitch_mix_bad.get(pitch, 0)
+            good_pct = pitch_mix_good.get(pitch, 0)
+            diff = bad_pct - good_pct
+            
+            if abs(diff) >= 10 and (bad_pct >= 10 or good_pct >= 10):  # Only include significant differences
+                direction = "increased" if diff > 0 else "decreased"
+                pitch_mix_diffs.append({
+                    'pitch': pitch,
+                    'diff': abs(diff),
+                    'direction': direction,
+                    'bad_pct': bad_pct,
+                    'good_pct': good_pct
+                })
+        
+        # Add pitch mix description if there were significant differences
+        if pitch_mix_diffs:
+            top_diff = pitch_mix_diffs[0]
+            pitch_name = self.get_full_pitch_name(top_diff['pitch'])
+            if top_diff['direction'] == 'increased':
+                bad_start_narrative.append(f"The approach differed significantly from successful outings, with heavy reliance on the {pitch_name} ({top_diff['pitch']}) at {top_diff['bad_pct']:.1f}% of pitches.")
+            else:
+                bad_start_narrative.append(f"The approach differed significantly from successful outings, with reduced usage of the normally effective {pitch_name} ({top_diff['pitch']}) at only {top_diff['bad_pct']:.1f}% of pitches.")
+        
+        # Add velocity issues if applicable
+        velocity_diffs = []
+        for pitch_type in set(self.bad_game_data['pitch_type'].unique()).intersection(
+                set(self.good_games_data['pitch_type'].unique())):
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch_type]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch_type]
+            
+            # Filter out missing values
+            bad_pitch_data = bad_pitch_data[~bad_pitch_data['velocity'].isna()]
+            good_pitch_data = good_pitch_data[~good_pitch_data['velocity'].isna()]
+            
+            if len(bad_pitch_data) >= 3 and len(good_pitch_data) >= 3:
+                try:
+                    bad_velo = bad_pitch_data['velocity'].mean()
+                    good_velo = good_pitch_data['velocity'].mean()
+                    diff = bad_velo - good_velo
+                    
+                    if abs(diff) >= 1.0:  # Only include meaningful differences
+                        direction = "higher" if diff > 0 else "lower"
+                        velocity_diffs.append({
+                            'pitch': pitch_type,
+                            'diff': abs(diff),
+                            'direction': direction,
+                            'bad_velo': bad_velo,
+                            'good_velo': good_velo
+                        })
+                except:
+                    continue
+                    
+        # Sort by diff magnitude
+        velocity_diffs.sort(key=lambda x: x['diff'], reverse=True)
+                    
+        if velocity_diffs:
+            top_velo_diff = velocity_diffs[0]
+            pitch_name = self.get_full_pitch_name(top_velo_diff['pitch'])
+            if top_velo_diff['direction'] == 'lower':
+                bad_start_narrative.append(f"Velocity was noticeably down, with the {pitch_name} averaging {top_velo_diff['bad_velo']:.1f} mph ({top_velo_diff['diff']:.1f} mph lower than usual).")
+        
+        # Add concluding statement about bad start
+        # Convert innings pitched from string to float for comparison
+        bad_ip_float = 0
+        if '.' in bad_ip:
+            whole, fraction = bad_ip.split('.')
+            bad_ip_float = float(whole) + float(fraction) / 3  # Baseball notation: .1 = ⅓ inning, .2 = ⅔ inning
+        else:
+            bad_ip_float = float(bad_ip)
+            
+        if bad_k < 4 and bad_ip_float >= 4:
+            bad_start_narrative.append(f"With only {bad_k} strikeouts over {bad_ip} innings, the lack of swing-and-miss stuff was evident throughout the outing.")
+        
+        # Add the bad start narrative to the summary
+        for paragraph in bad_start_narrative:
+            summary.append("\n" + paragraph)
+        
+        # Add narrative for the good start
+        summary.append("\n### The Success: " + good_game_date_str + " vs " + good_opponent)
+        summary.append(f"\n**Final Line:** {good_ip} IP, {good_k} K, {good_bb} BB, {good_h} H, {good_hr} HR, ~{good_er:.1f} ER ({good_total} pitches, {good_strike_pct:.1f}% strikes)")
+        
+        # Create a narrative description of the good start
+        good_start_narrative = []
+        
+        # Describe the overall performance
+        if good_score >= 75:
+            good_start_narrative.append(f"{pitcher_name} was dominant against {good_opponent}, delivering an exceptional performance with complete command.")
+        elif good_score >= 65:
+            good_start_narrative.append(f"{pitcher_name} was very effective against {good_opponent}, showing excellent control and execution.")
+        else:
+            good_start_narrative.append(f"{pitcher_name} had a solid outing against {good_opponent}, consistently executing the game plan.")
+        
+        # Describe command if it was good
+        if good_strike_pct >= 65:
+            good_start_narrative.append(f"Command was excellent, with {good_strike_pct:.1f}% of pitches going for strikes, keeping hitters on the defensive.")
+        
+        # Describe strikeout performance if notable
+        if good_k >= 7:
+            good_start_narrative.append(f"The swing-and-miss stuff was working, resulting in {good_k} strikeouts.")
+        
+        # Describe pitch mix effectiveness
+        top_pitches_good = pitch_mix_good.sort_values(ascending=False).head(2)
+        if not top_pitches_good.empty:
+            pitch_names = [f"{self.get_full_pitch_name(p)} ({p})" for p in top_pitches_good.index]
+            pitch_pcts = [f"{pct:.1f}%" for pct in top_pitches_good.values]
+            
+            pitch_description = ", ".join([f"{name} at {pct}" for name, pct in zip(pitch_names, pitch_pcts)])
+            good_start_narrative.append(f"The pitch mix was well-balanced, with heavy usage of {pitch_description} leading the way.")
+        
+        # Add velocity description if it was good
+        if velocity_diffs:
+            for diff in velocity_diffs:
+                if diff['direction'] == 'higher' and diff['pitch'] in ['FF', 'FT', 'SI', 'FA']:  # Fastball variants
+                    pitch_name = self.get_full_pitch_name(diff['pitch'])
+                    good_start_narrative.append(f"The {pitch_name} had excellent velocity at {diff['good_velo']:.1f} mph, helping to set up the rest of the arsenal.")
+                    break
+        
+        # Add the good start narrative to the summary
+        for paragraph in good_start_narrative:
+            summary.append("\n" + paragraph)
+        
+        # Add a comparative conclusion section
+        summary.append("\n### What Made the Difference")
+        
+        # Identify key differences
+        diff_narrative = []
+        
+        # Compare innings pitched
+        # Convert innings pitched strings to float values
+        def ip_to_float(ip_str):
+            """Convert innings pitched string (e.g. '5.2' for 5⅔ innings) to float value"""
+            if '.' not in ip_str:
+                return float(ip_str)
+            
+            whole, fraction = ip_str.split('.')
+            # In baseball notation, .1 = 1/3 inning and .2 = 2/3 inning
+            return float(whole) + float(fraction) / 3
+            
+        bad_ip_float = ip_to_float(bad_ip)
+        good_ip_float = ip_to_float(good_ip)
+        ip_diff = bad_ip_float - good_ip_float
+        if abs(ip_diff) >= 2:
+            if ip_diff < 0:
+                diff_narrative.append(f"**Duration**: The bad start was {abs(ip_diff):.1f} innings shorter, potentially indicating early struggles or a quick hook due to ineffectiveness.")
+            else:
+                diff_narrative.append(f"**Duration**: Despite lasting {ip_diff:.1f} innings longer in the bad start, the overall performance was worse, suggesting a grinding, inefficient outing.")
+        
+        # Compare strike percentage
+        strike_diff = bad_strike_pct - good_strike_pct
+        if abs(strike_diff) >= 5:
+            if strike_diff < 0:
+                diff_narrative.append(f"**Command**: Strike percentage was {abs(strike_diff):.1f}% lower in the bad start, forcing more pitches outside the zone and behind in counts.")
+            else:
+                diff_narrative.append(f"**Command**: Despite a {strike_diff:.1f}% higher strike percentage in the bad start, the quality of those strikes was likely poorer, catching too much of the plate.")
+        
+        # Add pitch efficiency conclusion if significant
+        # Convert innings pitched to calculate pitches per inning
+        bad_pitches_per_inning = bad_total / ip_to_float(bad_ip)
+        good_pitches_per_inning = good_total / ip_to_float(good_ip)
+        efficiency_diff = bad_pitches_per_inning - good_pitches_per_inning
+        
+        if abs(efficiency_diff) >= 3:
+            if efficiency_diff > 0:
+                diff_narrative.append(f"**Efficiency**: The bad start required {efficiency_diff:.1f} more pitches per inning, indicating longer at-bats and more foul balls or deep counts.")
+        
+        # Compare K/BB ratio
+        if bad_bb > 0 and good_bb > 0:
+            bad_k_bb_ratio = bad_k / bad_bb
+            good_k_bb_ratio = good_k / good_bb
+            
+            ratio_diff = bad_k_bb_ratio - good_k_bb_ratio
+            if abs(ratio_diff) >= 1:
+                if ratio_diff < 0:
+                    diff_narrative.append(f"**K/BB Ratio**: The K/BB ratio dropped from {good_k_bb_ratio:.1f} to {bad_k_bb_ratio:.1f}, showing diminished ability to get strikeouts without walks.")
+        
+        # Add pitch mix conclusion if significant
+        if pitch_mix_diffs:
+            pitch_conclusion = "**Pitch Selection**: The approach differed significantly, with "
+            
+            mix_details = []
+            for diff in pitch_mix_diffs[:2]:  # Focus on top 2 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                if diff['direction'] == 'increased':
+                    mix_details.append(f"{diff['diff']:.1f}% higher {pitch_name} usage")
+                else:
+                    mix_details.append(f"{diff['diff']:.1f}% lower {pitch_name} usage")
+            
+            pitch_conclusion += ", ".join(mix_details) + "."
+            diff_narrative.append(pitch_conclusion)
+        
+        # Add velocity conclusion if significant
+        if velocity_diffs:
+            velo_conclusion = "**Velocity**: "
+            
+            velo_details = []
+            for diff in velocity_diffs[:2]:  # Focus on top 2 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                velo_details.append(f"{pitch_name} was {diff['diff']:.1f} mph {diff['direction']}")
+            
+            velo_conclusion += ", ".join(velo_details) + "."
+            diff_narrative.append(velo_conclusion)
+            
+        # Add what made the difference to the summary
+        if diff_narrative:
+            for item in diff_narrative:
+                summary.append("\n" + item)
+        else:
+            summary.append("\nThe difference between these starts comes down to subtle execution issues rather than any clearly identifiable statistical pattern.")
+        
+        # Add GameScore comparison
+        summary.append("\n## Statistical Comparison")
+        
+        summary.append(f"\n**GameScore Comparison:**")
+        summary.append(f"- Bad Start: **{bad_score:.1f}**")
+        summary.append(f"- Good Start: **{good_score:.1f}**")
+        summary.append(f"- Difference: **{bad_score - good_score:.1f}** points")
+        
+        # Add basic stat comparison
+        summary.append(f"\n**Basic Stats Comparison:**")
+        
+        # Create a comparison table of key metrics
+        summary.append("\n| Metric | Bad Start | Good Start | Difference |")
+        summary.append("| ------ | --------- | ---------- | ---------- |")
+        
+        # Add innings pitched
+        summary.append(f"| Innings Pitched | {bad_ip} | {good_ip} | - |")
+        
+        # Add strikeouts
+        summary.append(f"| Strikeouts | {bad_k} | {good_k} | {bad_k - good_k:+d} |")
+        
+        # Add walks
+        summary.append(f"| Walks | {bad_bb} | {good_bb} | {bad_bb - good_bb:+d} |")
+        
+        # Add hits
+        summary.append(f"| Hits | {bad_h} | {good_h} | {bad_h - good_h:+d} |")
+        
+        # Add home runs
+        summary.append(f"| Home Runs | {bad_hr} | {good_hr} | {bad_hr - good_hr:+d} |")
+        
+        # Add K/9
+        bad_k9 = self.bad_game_metrics['k_per_9']
+        good_k9 = self.good_game_metrics['k_per_9']
+        summary.append(f"| K/9 | {bad_k9:.1f} | {good_k9:.1f} | {bad_k9 - good_k9:+.1f} |")
+        
+        # Add BB/9
+        bad_bb9 = self.bad_game_metrics['bb_per_9']
+        good_bb9 = self.good_game_metrics['bb_per_9']
+        summary.append(f"| BB/9 | {bad_bb9:.1f} | {good_bb9:.1f} | {bad_bb9 - good_bb9:+.1f} |")
+        
+        # Add WHIP
+        bad_whip = self.bad_game_metrics['whip']
+        good_whip = self.good_game_metrics['whip']
+        summary.append(f"| WHIP | {bad_whip:.2f} | {good_whip:.2f} | {bad_whip - good_whip:+.2f} |")
+        
+        summary.append(f"| Strike % | {bad_strike_pct:.1f}% | {good_strike_pct:.1f}% | {bad_strike_pct - good_strike_pct:+.1f}% |")
+        
+        # Add total pitches
+        summary.append(f"| Total Pitches | {bad_total} | {good_total} | {bad_total - good_total:+d} |")
+        
+        # Executive summary of key findings
+        summary.append("\n## Executive Summary: Why This Start Was Different")
+        
+        # Add key problems based on our analyses
+        key_differences = []
+        
+        # Check pitch mix for significant changes
+        pitch_mix_bad = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        pitch_mix_good = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        pitch_mix_diffs = []
+        for pitch in set(pitch_mix_bad.index).union(set(pitch_mix_good.index)):
+            bad_pct = pitch_mix_bad.get(pitch, 0)
+            good_pct = pitch_mix_good.get(pitch, 0)
+            diff = bad_pct - good_pct
+            
+            if abs(diff) >= 5 and (bad_pct >= 5 or good_pct >= 5):  # Only include significant differences
+                direction = "increased" if diff > 0 else "decreased"
+                pitch_mix_diffs.append({
+                    'pitch': pitch,
+                    'diff': abs(diff),
+                    'direction': direction,
+                    'bad_pct': bad_pct,
+                    'good_pct': good_pct
+                })
+        
+        # Sort by magnitude of difference
+        pitch_mix_diffs.sort(key=lambda x: x['diff'], reverse=True)
+        
+        if pitch_mix_diffs:
+            pitch_mix_issue = "**Pitch Mix Differences**: "
+            mix_details = []
+            
+            for diff in pitch_mix_diffs[:3]:  # Focus on top 3 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                mix_details.append(f"{pitch_name} ({diff['pitch']}) usage {diff['direction']} from {diff['good_pct']:.1f}% to {diff['bad_pct']:.1f}% ({abs(diff['diff']):+.1f}%)")
+            
+            pitch_mix_issue += ", ".join(mix_details)
+            key_differences.append(pitch_mix_issue)
+        
+        # Check velocity issues
+        velocity_diffs = []
+        
+        for pitch_type in set(self.bad_game_data['pitch_type'].unique()).intersection(
+                set(self.good_games_data['pitch_type'].unique())):
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch_type]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch_type]
+            
+            # Filter out missing values
+            bad_pitch_data = bad_pitch_data[~bad_pitch_data['velocity'].isna()]
+            good_pitch_data = good_pitch_data[~good_pitch_data['velocity'].isna()]
+            
+            if len(bad_pitch_data) >= 3 and len(good_pitch_data) >= 3:
+                try:
+                    bad_velo = bad_pitch_data['velocity'].mean()
+                    good_velo = good_pitch_data['velocity'].mean()
+                    diff = bad_velo - good_velo
+                    
+                    if abs(diff) >= 0.7:  # Only include meaningful differences
+                        direction = "higher" if diff > 0 else "lower"
+                        velocity_diffs.append({
+                            'pitch': pitch_type,
+                            'diff': abs(diff),
+                            'direction': direction,
+                            'bad_velo': bad_velo,
+                            'good_velo': good_velo
+                        })
+                except Exception as e:
+                    print(f"Error calculating velocity for {pitch_type}: {e}")
+                    continue
+        
+        # Sort by magnitude of difference
+        velocity_diffs.sort(key=lambda x: x['diff'], reverse=True)
+        
+        if velocity_diffs:
+            velo_issue = "**Velocity Differences**: "
+            velo_details = []
+            
+            for diff in velocity_diffs[:2]:  # Focus on top 2 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                velo_details.append(f"{pitch_name} ({diff['pitch']}) was {diff['diff']:.1f} mph {diff['direction']}")
+            
+            velo_issue += ", ".join(velo_details) + "."
+            key_differences.append(velo_issue)
+            
+        # Check for velocity degradation differences
+        # Focus on fastball types
+        fastball_types = ['FF', 'FT', 'SI', 'FA']
+        primary_fb = None
+        
+        for fb_type in fastball_types:
+            if fb_type in self.bad_game_data['pitch_type'].values and fb_type in self.good_games_data['pitch_type'].values:
+                primary_fb = fb_type
+                break
+        
+        if primary_fb:
+            # Filter data
+            bad_fb = self.bad_game_data[self.bad_game_data['pitch_type'] == primary_fb]
+            bad_fb = bad_fb[~bad_fb['velocity'].isna()]
+            
+            good_fb = self.good_games_data[self.good_games_data['pitch_type'] == primary_fb]
+            good_fb = good_fb[~good_fb['velocity'].isna()]
+            
+            if len(bad_fb) >= 10 and len(good_fb) >= 10:
+                # Calculate velocity drop for each game
+                bad_start_velo = bad_fb.iloc[0]['velocity'] if not bad_fb.empty else 0
+                bad_end_velo = bad_fb.iloc[-1]['velocity'] if not bad_fb.empty else 0
+                bad_velo_drop = bad_start_velo - bad_end_velo
+                
+                good_start_velo = good_fb.iloc[0]['velocity'] if not good_fb.empty else 0
+                good_end_velo = good_fb.iloc[-1]['velocity'] if not good_fb.empty else 0
+                good_velo_drop = good_start_velo - good_end_velo
+                
+                # Compare the drops
+                drop_diff = bad_velo_drop - good_velo_drop
+                
+                if abs(drop_diff) >= 0.8:
+                    if drop_diff > 0:
+                        key_differences.append(f"**Velocity Degradation**: Fastball velocity dropped more in the bad start ({bad_velo_drop:.1f} mph) compared to the good start ({good_velo_drop:.1f} mph)")
+                    else:
+                        key_differences.append(f"**Velocity Degradation**: Fastball velocity was more consistent in the bad start (drop: {bad_velo_drop:.1f} mph) compared to the good start (drop: {good_velo_drop:.1f} mph)")
+                        
+        # Check location issues
+        # Filter out missing location data first
+        bad_valid_loc = self.bad_game_data[~self.bad_game_data['location_x'].isna() & 
+                                         ~self.bad_game_data['location_z'].isna()]
+        good_valid_loc = self.good_games_data[~self.good_games_data['location_x'].isna() & 
+                                            ~self.good_games_data['location_z'].isna()]
+        
+        # Define strike zone boundaries
+        zone_width = 1.7  # Strike zone width in feet
+        zone_height = 2.0  # Strike zone height in feet
+        zone_left = -zone_width/2
+        zone_right = zone_width/2
+        zone_bottom = 1.5  # Approximate bottom of strike zone
+        zone_top = zone_bottom + zone_height
+        
+        # Calculate how many pitches were in the zone
+        if not bad_valid_loc.empty and not good_valid_loc.empty:
+            bad_in_zone = sum((bad_valid_loc['location_x'] >= zone_left) & 
+                             (bad_valid_loc['location_x'] <= zone_right) & 
+                             (bad_valid_loc['location_z'] >= zone_bottom) & 
+                             (bad_valid_loc['location_z'] <= zone_top))
+            bad_zone_pct = (bad_in_zone / len(bad_valid_loc)) * 100
+            
+            good_in_zone = sum((good_valid_loc['location_x'] >= zone_left) & 
+                              (good_valid_loc['location_x'] <= zone_right) & 
+                              (good_valid_loc['location_z'] >= zone_bottom) & 
+                              (good_valid_loc['location_z'] <= zone_top))
+            good_zone_pct = (good_in_zone / len(good_valid_loc)) * 100
+            
+            zone_diff = bad_zone_pct - good_zone_pct
+            
+            if abs(zone_diff) >= 5:
+                if zone_diff < 0:
+                    key_differences.append(f"**Strike Zone Rate**: Fewer pitches in the zone in the bad start ({bad_zone_pct:.1f}% vs {good_zone_pct:.1f}% in good start)")
+                else:
+                    key_differences.append(f"**Strike Zone Rate**: More pitches in the zone in the bad start ({bad_zone_pct:.1f}% vs {good_zone_pct:.1f}% in good start), suggesting pitches might have been too hittable")
+        
+        # Check count management issues
+        bad_count_data = self.bad_game_data.copy()
+        good_count_data = self.good_games_data.copy()
+        
+        # Define count categories
+        hitter_counts = ['2-0', '3-0', '3-1', '2-1']
+        pitcher_counts = ['0-1', '0-2', '1-2', '2-2']
+        
+        # Calculate percentage of hitter/pitcher counts
+        if not bad_count_data.empty and not good_count_data.empty:
+            bad_hitter_pct = sum(bad_count_data['count'].isin(hitter_counts)) / len(bad_count_data) * 100
+            good_hitter_pct = sum(good_count_data['count'].isin(hitter_counts)) / len(good_count_data) * 100
+            
+            bad_pitcher_pct = sum(bad_count_data['count'].isin(pitcher_counts)) / len(bad_count_data) * 100
+            good_pitcher_pct = sum(good_count_data['count'].isin(pitcher_counts)) / len(good_count_data) * 100
+            
+            hitter_diff = bad_hitter_pct - good_hitter_pct
+            pitcher_diff = bad_pitcher_pct - good_pitcher_pct
+            
+            if hitter_diff >= 5:
+                key_differences.append(f"**Count Management**: Fell behind hitters more often in the bad start ({bad_hitter_pct:.1f}% hitter's counts vs {good_hitter_pct:.1f}% in good start)")
+            
+            if pitcher_diff <= -5:
+                key_differences.append(f"**Count Management**: Got ahead of hitters less often in the bad start ({bad_pitcher_pct:.1f}% pitcher's counts vs {good_pitcher_pct:.1f}% in good start)")
+            
+            # Check first-pitch strike percentage
+            bad_first_pitch = bad_count_data[bad_count_data['count'] == '0-0']
+            good_first_pitch = good_count_data[good_count_data['count'] == '0-0']
+            
+            if len(bad_first_pitch) > 0 and len(good_first_pitch) > 0:
+                bad_first_strike_pct = sum(bad_first_pitch['strike_ball'] == 'strike') / len(bad_first_pitch) * 100
+                good_first_strike_pct = sum(good_first_pitch['strike_ball'] == 'strike') / len(good_first_pitch) * 100
+                
+                first_pitch_diff = bad_first_strike_pct - good_first_strike_pct
+                
+                if first_pitch_diff <= -10:
+                    key_differences.append(f"**First-Pitch Strikes**: Significantly fewer first-pitch strikes in the bad start ({bad_first_strike_pct:.1f}% vs {good_first_strike_pct:.1f}% in good start)")
+        
+        # Check performance against different batter handedness
+        rh_batters_bad = bad_count_data[bad_count_data['stand'] == 'R']
+        lh_batters_bad = bad_count_data[bad_count_data['stand'] == 'L']
+        
+        rh_batters_good = good_count_data[good_count_data['stand'] == 'R']
+        lh_batters_good = good_count_data[good_count_data['stand'] == 'L']
+        
+        # Calculate success ratios against RHB
+        if not rh_batters_bad.empty and not rh_batters_good.empty:
+            rhb_bad_good = sum(rh_batters_bad['pitch_result'] == 'good')
+            rhb_bad_bad = sum(rh_batters_bad['pitch_result'] == 'bad')
+            rhb_bad_total = rhb_bad_good + rhb_bad_bad if (rhb_bad_good + rhb_bad_bad) > 0 else 1
+            
+            rhb_good_good = sum(rh_batters_good['pitch_result'] == 'good')
+            rhb_good_bad = sum(rh_batters_good['pitch_result'] == 'bad')
+            rhb_good_total = rhb_good_good + rhb_good_bad if (rhb_good_good + rhb_good_bad) > 0 else 1
+            
+            rhb_bad_ratio = (rhb_bad_good / rhb_bad_total) * 100
+            rhb_good_ratio = (rhb_good_good / rhb_good_total) * 100
+            
+            rhb_diff = rhb_bad_ratio - rhb_good_ratio
+            
+            if rhb_diff <= -15 and len(rh_batters_bad) >= 10:
+                key_differences.append(f"**RHB Performance**: Struggled more against right-handed batters in the bad start ({rhb_bad_ratio:.1f}% success vs {rhb_good_ratio:.1f}% in good start)")
+        
+        # Calculate success ratios against LHB
+        if not lh_batters_bad.empty and not lh_batters_good.empty:
+            lhb_bad_good = sum(lh_batters_bad['pitch_result'] == 'good')
+            lhb_bad_bad = sum(lh_batters_bad['pitch_result'] == 'bad')
+            lhb_bad_total = lhb_bad_good + lhb_bad_bad if (lhb_bad_good + lhb_bad_bad) > 0 else 1
+            
+            lhb_good_good = sum(lh_batters_good['pitch_result'] == 'good')
+            lhb_good_bad = sum(lh_batters_good['pitch_result'] == 'bad')
+            lhb_good_total = lhb_good_good + lhb_good_bad if (lhb_good_good + lhb_good_bad) > 0 else 1
+            
+            lhb_bad_ratio = (lhb_bad_good / lhb_bad_total) * 100
+            lhb_good_ratio = (lhb_good_good / lhb_good_total) * 100
+            
+            lhb_diff = lhb_bad_ratio - lhb_good_ratio
+            
+            if lhb_diff <= -15 and len(lh_batters_bad) >= 10:
+                key_differences.append(f"**LHB Performance**: Struggled more against left-handed batters in the bad start ({lhb_bad_ratio:.1f}% success vs {lhb_good_ratio:.1f}% in good start)")
+        
+        # Add key differences to summary
+        if key_differences:
+            for i, difference in enumerate(key_differences):
+                summary.append(f"\n{i+1}. {difference}")
+        else:
+            summary.append("\nAnalysis did not identify any single major factor that explains the difference between these starts. The performance gap appears to result from a combination of minor differences rather than one dominant factor.")
+        
+        # Check pitch mix for significant changes
+        pitch_mix_bad = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        pitch_mix_good = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        pitch_mix_diffs = []
+        for pitch in set(pitch_mix_bad.index).union(set(pitch_mix_good.index)):
+            bad_pct = pitch_mix_bad.get(pitch, 0)
+            good_pct = pitch_mix_good.get(pitch, 0)
+            diff = bad_pct - good_pct
+            
+            if abs(diff) >= 5 and (bad_pct >= 5 or good_pct >= 5):  # Only include significant differences
+                direction = "increased" if diff > 0 else "decreased"
+                pitch_mix_diffs.append({
+                    'pitch': pitch,
+                    'diff': abs(diff),
+                    'direction': direction,
+                    'bad_pct': bad_pct,
+                    'good_pct': good_pct
+                })
+        
+        # Sort by magnitude of difference
+        pitch_mix_diffs.sort(key=lambda x: x['diff'], reverse=True)
+        
+        if pitch_mix_diffs:
+            pitch_mix_issue = "**Pitch Mix Differences**: "
+            mix_details = []
+            
+            for diff in pitch_mix_diffs[:3]:  # Focus on top 3 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                mix_details.append(f"{pitch_name} ({diff['pitch']}) usage {diff['direction']} from {diff['good_pct']:.1f}% to {diff['bad_pct']:.1f}% ({abs(diff['diff']):+.1f}%)")
+            
+            pitch_mix_issue += ", ".join(mix_details)
+            key_differences.append(pitch_mix_issue)
+        
+        # Check velocity issues
+        velocity_diffs = []
+        
+        for pitch_type in set(self.bad_game_data['pitch_type'].unique()).intersection(
+                set(self.good_games_data['pitch_type'].unique())):
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch_type]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch_type]
+            
+            # Filter out missing values
+            bad_pitch_data = bad_pitch_data[~bad_pitch_data['velocity'].isna()]
+            good_pitch_data = good_pitch_data[~good_pitch_data['velocity'].isna()]
+            
+            if len(bad_pitch_data) >= 3 and len(good_pitch_data) >= 3:
+                try:
+                    bad_velo = bad_pitch_data['velocity'].mean()
+                    good_velo = good_pitch_data['velocity'].mean()
+                    diff = bad_velo - good_velo
+                    
+                    if abs(diff) >= 0.7:  # Only include meaningful differences
+                        direction = "higher" if diff > 0 else "lower"
+                        velocity_diffs.append({
+                            'pitch': pitch_type,
+                            'diff': abs(diff),
+                            'direction': direction,
+                            'bad_velo': bad_velo,
+                            'good_velo': good_velo
+                        })
+                except Exception as e:
+                    print(f"Error calculating velocity for {pitch_type}: {e}")
+                    continue
+        
+        # Sort by magnitude of difference
+        velocity_diffs.sort(key=lambda x: x['diff'], reverse=True)
+        
+        if velocity_diffs:
+            velo_issue = "**Velocity Differences**: "
+            velo_details = []
+            
+            for diff in velocity_diffs[:2]:  # Focus on top 2 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                velo_details.append(f"{pitch_name} ({diff['pitch']}) was {diff['diff']:.1f} mph {diff['direction']} ({diff['bad_velo']:.1f} mph vs {diff['good_velo']:.1f} mph)")
+            
+            velo_issue += ", ".join(velo_details)
+            key_differences.append(velo_issue)
+            
+        # Check for velocity degradation differences
+        # Focus on fastball types
+        fastball_types = ['FF', 'FT', 'SI', 'FA']
+        primary_fb = None
+        
+        for fb_type in fastball_types:
+            if fb_type in self.bad_game_data['pitch_type'].values and fb_type in self.good_games_data['pitch_type'].values:
+                primary_fb = fb_type
+                break
+        
+        if primary_fb:
+            # Filter data
+            bad_fb = self.bad_game_data[self.bad_game_data['pitch_type'] == primary_fb]
+            bad_fb = bad_fb[~bad_fb['velocity'].isna()]
+            
+            good_fb = self.good_games_data[self.good_games_data['pitch_type'] == primary_fb]
+            good_fb = good_fb[~good_fb['velocity'].isna()]
+            
+            if len(bad_fb) >= 10 and len(good_fb) >= 10:
+                # Calculate velocity drop for each game
+                bad_start_velo = bad_fb.iloc[0]['velocity'] if not bad_fb.empty else 0
+                bad_end_velo = bad_fb.iloc[-1]['velocity'] if not bad_fb.empty else 0
+                bad_velo_drop = bad_start_velo - bad_end_velo
+                
+                good_start_velo = good_fb.iloc[0]['velocity'] if not good_fb.empty else 0
+                good_end_velo = good_fb.iloc[-1]['velocity'] if not good_fb.empty else 0
+                good_velo_drop = good_start_velo - good_end_velo
+                
+                # Compare the drops
+                drop_diff = bad_velo_drop - good_velo_drop
+                
+                if abs(drop_diff) >= 0.8:
+                    if drop_diff > 0:
+                        key_differences.append(f"**Velocity Degradation**: Fastball velocity dropped more in the bad start ({bad_velo_drop:.1f} mph) compared to the good start ({good_velo_drop:.1f} mph)")
+                    else:
+                        key_differences.append(f"**Velocity Degradation**: Fastball velocity was more consistent in the bad start (drop: {bad_velo_drop:.1f} mph) compared to the good start (drop: {good_velo_drop:.1f} mph)")
+                        
+        # Check location issues
+        # Filter out missing location data first
+        bad_valid_loc = self.bad_game_data[~self.bad_game_data['location_x'].isna() & 
+                                         ~self.bad_game_data['location_z'].isna()]
+        good_valid_loc = self.good_games_data[~self.good_games_data['location_x'].isna() & 
+                                            ~self.good_games_data['location_z'].isna()]
+        
+        # Define strike zone boundaries
+        zone_width = 1.7  # Strike zone width in feet
+        zone_height = 2.0  # Strike zone height in feet
+        zone_left = -zone_width/2
+        zone_right = zone_width/2
+        zone_bottom = 1.5  # Approximate bottom of strike zone
+        zone_top = zone_bottom + zone_height
+        
+        # Calculate how many pitches were in the zone
+        if not bad_valid_loc.empty and not good_valid_loc.empty:
+            bad_in_zone = sum((bad_valid_loc['location_x'] >= zone_left) & 
+                             (bad_valid_loc['location_x'] <= zone_right) & 
+                             (bad_valid_loc['location_z'] >= zone_bottom) & 
+                             (bad_valid_loc['location_z'] <= zone_top))
+            bad_zone_pct = (bad_in_zone / len(bad_valid_loc)) * 100
+            
+            good_in_zone = sum((good_valid_loc['location_x'] >= zone_left) & 
+                              (good_valid_loc['location_x'] <= zone_right) & 
+                              (good_valid_loc['location_z'] >= zone_bottom) & 
+                              (good_valid_loc['location_z'] <= zone_top))
+            good_zone_pct = (good_in_zone / len(good_valid_loc)) * 100
+            
+            zone_diff = bad_zone_pct - good_zone_pct
+            
+            if abs(zone_diff) >= 5:
+                if zone_diff < 0:
+                    key_differences.append(f"**Strike Zone Rate**: Fewer pitches in the zone in the bad start ({bad_zone_pct:.1f}% vs {good_zone_pct:.1f}% in good start)")
+                else:
+                    key_differences.append(f"**Strike Zone Rate**: More pitches in the zone in the bad start ({bad_zone_pct:.1f}% vs {good_zone_pct:.1f}% in good start), suggesting pitches might have been too hittable")
+        
+        # Check count management issues
+        bad_count_data = self.bad_game_data.copy()
+        good_count_data = self.good_games_data.copy()
+        
+        # Define count categories
+        hitter_counts = ['2-0', '3-0', '3-1', '2-1']
+        pitcher_counts = ['0-1', '0-2', '1-2', '2-2']
+        
+        # Calculate percentage of hitter/pitcher counts
+        if not bad_count_data.empty and not good_count_data.empty:
+            bad_hitter_pct = sum(bad_count_data['count'].isin(hitter_counts)) / len(bad_count_data) * 100
+            good_hitter_pct = sum(good_count_data['count'].isin(hitter_counts)) / len(good_count_data) * 100
+            
+            bad_pitcher_pct = sum(bad_count_data['count'].isin(pitcher_counts)) / len(bad_count_data) * 100
+            good_pitcher_pct = sum(good_count_data['count'].isin(pitcher_counts)) / len(good_count_data) * 100
+            
+            hitter_diff = bad_hitter_pct - good_hitter_pct
+            pitcher_diff = bad_pitcher_pct - good_pitcher_pct
+            
+            if hitter_diff >= 5:
+                key_differences.append(f"**Count Management**: Fell behind hitters more often in the bad start ({bad_hitter_pct:.1f}% hitter's counts vs {good_hitter_pct:.1f}% in good start)")
+            
+            if pitcher_diff <= -5:
+                key_differences.append(f"**Count Management**: Got ahead of hitters less often in the bad start ({bad_pitcher_pct:.1f}% pitcher's counts vs {good_pitcher_pct:.1f}% in good start)")
+            
+            # Check first-pitch strike percentage
+            bad_first_pitch = bad_count_data[bad_count_data['count'] == '0-0']
+            good_first_pitch = good_count_data[good_count_data['count'] == '0-0']
+            
+            if len(bad_first_pitch) > 0 and len(good_first_pitch) > 0:
+                bad_first_strike_pct = sum(bad_first_pitch['strike_ball'] == 'strike') / len(bad_first_pitch) * 100
+                good_first_strike_pct = sum(good_first_pitch['strike_ball'] == 'strike') / len(good_first_pitch) * 100
+                
+                first_pitch_diff = bad_first_strike_pct - good_first_strike_pct
+                
+                if first_pitch_diff <= -10:
+                    key_differences.append(f"**First-Pitch Strikes**: Significantly fewer first-pitch strikes in the bad start ({bad_first_strike_pct:.1f}% vs {good_first_strike_pct:.1f}% in good start)")
+        
+        # Check performance against different batter handedness
+        rh_batters_bad = bad_count_data[bad_count_data['stand'] == 'R']
+        lh_batters_bad = bad_count_data[bad_count_data['stand'] == 'L']
+        
+        rh_batters_good = good_count_data[good_count_data['stand'] == 'R']
+        lh_batters_good = good_count_data[good_count_data['stand'] == 'L']
+        
+        # Calculate success ratios against RHB
+        if not rh_batters_bad.empty and not rh_batters_good.empty:
+            rhb_bad_good = sum(rh_batters_bad['pitch_result'] == 'good')
+            rhb_bad_bad = sum(rh_batters_bad['pitch_result'] == 'bad')
+            rhb_bad_total = rhb_bad_good + rhb_bad_bad if (rhb_bad_good + rhb_bad_bad) > 0 else 1
+            
+            rhb_good_good = sum(rh_batters_good['pitch_result'] == 'good')
+            rhb_good_bad = sum(rh_batters_good['pitch_result'] == 'bad')
+            rhb_good_total = rhb_good_good + rhb_good_bad if (rhb_good_good + rhb_good_bad) > 0 else 1
+            
+            rhb_bad_ratio = (rhb_bad_good / rhb_bad_total) * 100
+            rhb_good_ratio = (rhb_good_good / rhb_good_total) * 100
+            
+            rhb_diff = rhb_bad_ratio - rhb_good_ratio
+            
+            if rhb_diff <= -15 and len(rh_batters_bad) >= 10:
+                key_differences.append(f"**RHB Performance**: Struggled more against right-handed batters in the bad start ({rhb_bad_ratio:.1f}% success vs {rhb_good_ratio:.1f}% in good start)")
+        
+        # Calculate success ratios against LHB
+        if not lh_batters_bad.empty and not lh_batters_good.empty:
+            lhb_bad_good = sum(lh_batters_bad['pitch_result'] == 'good')
+            lhb_bad_bad = sum(lh_batters_bad['pitch_result'] == 'bad')
+            lhb_bad_total = lhb_bad_good + lhb_bad_bad if (lhb_bad_good + lhb_bad_bad) > 0 else 1
+            
+            lhb_good_good = sum(lh_batters_good['pitch_result'] == 'good')
+            lhb_good_bad = sum(lh_batters_good['pitch_result'] == 'bad')
+            lhb_good_total = lhb_good_good + lhb_good_bad if (lhb_good_good + lhb_good_bad) > 0 else 1
+            
+            lhb_bad_ratio = (lhb_bad_good / lhb_bad_total) * 100
+            lhb_good_ratio = (lhb_good_good / lhb_good_total) * 100
+            
+            lhb_diff = lhb_bad_ratio - lhb_good_ratio
+            
+            if lhb_diff <= -15 and len(lh_batters_bad) >= 10:
+                key_differences.append(f"**LHB Performance**: Struggled more against left-handed batters in the bad start ({lhb_bad_ratio:.1f}% success vs {lhb_good_ratio:.1f}% in good start)")
+        
+        # Add key differences to summary
+        if key_differences:
+            for i, difference in enumerate(key_differences):
+                summary.append(f"{i+1}. {difference}")
+        else:
+            summary.append("Analysis did not identify any single major factor that explains the difference between these starts. The performance gap appears to result from a combination of minor differences rather than one dominant factor.")
+        
+        # Add detailed analysis sections
+        summary.append("\n## Detailed Analysis")
+        
+        # 1. Pitch Mix Analysis
+        summary.append("\n### Pitch Mix Analysis")
+        
+        pitch_counts_bad = self.bad_game_data['pitch_type'].value_counts()
+        pitch_pcts_bad = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        pitch_counts_good = self.good_games_data['pitch_type'].value_counts()
+        pitch_pcts_good = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        # Create a table of pitch types
+        summary.append("\n| Pitch Type | Bad Start Usage | Good Start Usage | Difference |")
+        summary.append("| ---------- | --------------- | ---------------- | ---------- |")
+        
+        for pitch in sorted(set(pitch_pcts_bad.index).union(set(pitch_pcts_good.index))):
+            bad_pct = pitch_pcts_bad.get(pitch, 0)
+            good_pct = pitch_pcts_good.get(pitch, 0)
+            diff = bad_pct - good_pct
+            
+            # Only include pitches with meaningful usage
+            if bad_pct >= 3 or good_pct >= 3:
+                full_name = self.get_full_pitch_name(pitch)
+                
+                # Format the difference with a sign
+                if diff > 0:
+                    diff_str = f"+{diff:.1f}%"
+                else:
+                    diff_str = f"{diff:.1f}%"
+                
+                summary.append(f"| {pitch} ({full_name}) | {bad_pct:.1f}% ({pitch_counts_bad.get(pitch, 0)}) | {good_pct:.1f}% ({pitch_counts_good.get(pitch, 0)}) | {diff_str} |")
+        
+        # Add narrative about pitch mix
+        if pitch_mix_diffs:
+            summary.append("\nSignificant differences in pitch usage were identified:")
+            
+            for diff in pitch_mix_diffs:
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                if diff['direction'] == 'increased':
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Usage was **{diff['diff']:.1f}%** higher than in the good start. This could indicate:")
+                    
+                    # Provide potential explanations
+                    if diff['diff'] >= 10:
+                        summary.append("  - Over-reliance on this pitch, making the pitcher more predictable")
+                        summary.append("  - Abandoning other effective pitches that were working in the good start")
+                        summary.append("  - Possible loss of feel for other pitches, forcing increased usage of this pitch")
+                else:
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Usage was **{diff['diff']:.1f}%** lower than in the good start. This could indicate:")
+                    
+                    # Provide potential explanations
+                    if diff['diff'] >= 10:
+                        summary.append("  - Lack of confidence in a previously effective pitch")
+                        summary.append("  - Inability to command this pitch effectively in this start")
+                        summary.append("  - Strategic decision against the specific opponent that didn't work out")
+        
+        # 2. Velocity Analysis
+        summary.append("\n### Velocity Analysis")
+        
+        if velocity_diffs:
+            summary.append("\nVelocity differences were detected in the following pitches:")
+            
+            for diff in velocity_diffs:
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                if diff['direction'] == 'lower':
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Velocity was **{diff['diff']:.1f} mph** lower than in the good start ({diff['bad_velo']:.1f} mph vs {diff['good_velo']:.1f} mph).")
+                    
+                    # Provide potential explanations for velocity drop
+                    if diff['diff'] >= 1.5:
+                        summary.append("  - Potential causes: mechanical issues, fatigue, injury concern, or deliberately sacrificing velocity for command")
+                else:
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Velocity was **{diff['diff']:.1f} mph** higher than in the good start ({diff['bad_velo']:.1f} mph vs {diff['good_velo']:.1f} mph).")
+                    
+                    # Provide potential explanations for velocity increase
+                    if diff['diff'] >= 1.5:
+                        summary.append("  - Potential causes: overthrowing, mechanical adjustments, or increased effort affecting command")
+        else:
+            summary.append("\nVelocity was consistent with the good start, suggesting that velocity differences were not a factor in the performance gap.")
+        
+        # Add velocity degradation comparison if available
+        if primary_fb and len(bad_fb) >= 10 and len(good_fb) >= 10:
+            # Calculate velocity drop for each game
+            bad_start_velo = bad_fb.iloc[0]['velocity'] if not bad_fb.empty else 0
+            bad_end_velo = bad_fb.iloc[-1]['velocity'] if not bad_fb.empty else 0
+            bad_velo_drop = bad_start_velo - bad_end_velo
+            
+            good_start_velo = good_fb.iloc[0]['velocity'] if not good_fb.empty else 0
+            good_end_velo = good_fb.iloc[-1]['velocity'] if not good_fb.empty else 0
+            good_velo_drop = good_start_velo - good_end_velo
+            
+            summary.append(f"\n**Velocity Degradation Comparison:**")
+            summary.append(f"- Bad Start: {primary_fb} velocity dropped from {bad_start_velo:.1f} mph to {bad_end_velo:.1f} mph (-{bad_velo_drop:.1f} mph)")
+            summary.append(f"- Good Start: {primary_fb} velocity dropped from {good_start_velo:.1f} mph to {good_end_velo:.1f} mph (-{good_velo_drop:.1f} mph)")
+            
+            drop_diff = bad_velo_drop - good_velo_drop
+            if abs(drop_diff) >= 0.5:
+                if drop_diff > 0:
+                    summary.append(f"\nThe greater velocity drop in the bad start suggests more fatigue or mechanical issues compared to the good start.")
+                else:
+                    summary.append(f"\nVelocity was actually more consistent in the bad start, suggesting fatigue was not a major factor in the performance difference.")
+            else:
+                summary.append(f"\nVelocity degradation patterns were similar in both starts.")
+        
+        # 3. Location Analysis
+        summary.append("\n### Location Analysis")
+        
+        # Compare strike zone percentages
+        if not bad_valid_loc.empty and not good_valid_loc.empty:
+            summary.append(f"\n**Strike Zone Analysis:**")
+            summary.append(f"- Bad Start: **{bad_zone_pct:.1f}%** of pitches in the strike zone")
+            summary.append(f"- Good Start: **{good_zone_pct:.1f}%** of pitches in the strike zone")
+            summary.append(f"- Difference: **{zone_diff:+.1f}%**")
+            
+            if zone_diff <= -5:
+                summary.append("\nThe significant reduction in zone percentage indicates command issues in the bad start, which likely contributed to falling behind in counts.")
+            elif zone_diff >= 5:
+                summary.append("\nThe higher zone percentage in the bad start might indicate pitches were too hittable, catching too much of the plate rather than working the edges as in the good start.")
+        
+        # Analyze hard hit balls location
+        # Filter for valid data
+        bad_pitches_with_launch = self.bad_game_data[~self.bad_game_data['launch_speed'].isna()]
+        bad_hard_contact = bad_pitches_with_launch[(bad_pitches_with_launch['pitch_result'] == 'bad') & 
+                                                 (bad_pitches_with_launch['launch_speed'] >= 95)]
+        
+        # Also ensure location data is valid
+        bad_hard_contact = bad_hard_contact[~bad_hard_contact['location_x'].isna() & 
+                                          ~bad_hard_contact['location_z'].isna()]
+        
+        if len(bad_hard_contact) >= 3:
+            # Analyze location of hard contact
+            hard_x_mean = bad_hard_contact['location_x'].mean()
+            hard_z_mean = bad_hard_contact['location_z'].mean()
+            
+            # Determine zone position
+            in_zone = ((hard_x_mean >= zone_left) and (hard_x_mean <= zone_right) and 
+                      (hard_z_mean >= zone_bottom) and (hard_z_mean <= zone_top))
+            
+            summary.append(f"\n**Hard Contact Analysis**: {len(bad_hard_contact)} pitches resulted in hard contact (exit velocity >= 95 mph) in the bad start.")
+            
+            if in_zone:
+                x_third = zone_width / 3
+                z_third = zone_height / 3
+                
+                x_pos = int((hard_x_mean - zone_left) / x_third)
+                z_pos = int((hard_z_mean - zone_bottom) / z_third)
+                
+                x_positions = ["inside", "middle", "outside"]
+                z_positions = ["low", "middle", "high"]
+                
+                if 0 <= x_pos < 3 and 0 <= z_pos < 3:
+                    hard_contact_zone = f"{z_positions[z_pos]} {x_positions[x_pos]}"
+                    summary.append(f"- Most hard contact came on pitches located {hard_contact_zone} in the zone.")
+                    summary.append(f"- This suggests the pitcher was either too predictable in this location or lacked deception/movement on pitches in this area.")
+            else:
+                if hard_x_mean < zone_left:
+                    summary.append("- Most hard contact came on pitches off the plate inside, suggesting hitters were looking for this location.")
+                elif hard_x_mean > zone_right:
+                    summary.append("- Most hard contact came on pitches off the plate outside, suggesting poor execution or hitters anticipating pitches in this location.")
+                elif hard_z_mean < zone_bottom:
+                    summary.append("- Most hard contact came on low pitches, suggesting breaking balls that didn't break enough or were hanging.")
+                elif hard_z_mean > zone_top:
+                    summary.append("- Most hard contact came on elevated pitches, suggesting fastballs that weren't located high enough or lacked movement.")
+            
+            # Analyze which pitch types got hit hard
+            hard_by_pitch = bad_hard_contact['pitch_type'].value_counts()
+            if not hard_by_pitch.empty:
+                worst_pitch = hard_by_pitch.index[0]
+                worst_pitch_name = self.get_full_pitch_name(worst_pitch)
+                worst_pitch_count = hard_by_pitch.iloc[0]
+                
+                summary.append(f"- The **{worst_pitch_name} ({worst_pitch})** was most susceptible to hard contact, accounting for {worst_pitch_count} of the {len(bad_hard_contact)} hard-hit balls.")
+        
+        # 4. Count Analysis
+        summary.append("\n### Count Analysis")
+        
+        # Calculate first-pitch strike
+        if len(bad_first_pitch) > 0 and len(good_first_pitch) > 0:
+            summary.append(f"\n**First Pitch Strike Comparison:**")
+            summary.append(f"- Bad Start: **{bad_first_strike_pct:.1f}%**")
+            summary.append(f"- Good Start: **{good_first_strike_pct:.1f}%**")
+            summary.append(f"- Difference: **{first_pitch_diff:+.1f}%**")
+            
+            if first_pitch_diff <= -10:
+                summary.append("\nThis substantial decrease in first-pitch strikes put the pitcher behind in counts more frequently in the bad start, forcing more predictable pitch selection.")
+            elif first_pitch_diff >= 10:
+                summary.append("\nThe pitcher was significantly better at getting ahead with the first pitch in the bad start, suggesting that count management was not the issue.")
+            else:
+                summary.append("\nFirst-pitch strike rates were similar in both starts.")
+        
+        # Count distributions
+        summary.append("\n**Count Distribution Comparison:**")
+        summary.append(f"- Hitter's Counts: **{bad_hitter_pct:.1f}%** in bad start vs **{good_hitter_pct:.1f}%** in good start ({hitter_diff:+.1f}%)")
+        summary.append(f"- Pitcher's Counts: **{bad_pitcher_pct:.1f}%** in bad start vs **{good_pitcher_pct:.1f}%** in good start ({pitcher_diff:+.1f}%)")
+        
+        if hitter_diff >= 5 or pitcher_diff <= -5:
+            summary.append("\nThe count distribution was significantly worse in the bad start, forcing the pitcher to throw more predictable pitches and reducing effectiveness.")
+        else:
+            summary.append("\nCount distribution was similar in both starts.")
+        
+        # 5. Handedness Analysis
+        summary.append("\n### Performance by Batter Handedness")
+        
+        if not rh_batters_bad.empty and not rh_batters_good.empty and not lh_batters_bad.empty and not lh_batters_good.empty:
+            rhb_bad_pct = len(rh_batters_bad) / len(self.bad_game_data) * 100
+            lhb_bad_pct = len(lh_batters_bad) / len(self.bad_game_data) * 100
+            
+            rhb_good_pct = len(rh_batters_good) / len(self.good_games_data) * 100
+            lhb_good_pct = len(lh_batters_good) / len(self.good_games_data) * 100
+            
+            summary.append(f"\n**Batter Handedness Distribution:**")
+            summary.append(f"- Bad Start: {rhb_bad_pct:.1f}% RHB, {lhb_bad_pct:.1f}% LHB")
+            summary.append(f"- Good Start: {rhb_good_pct:.1f}% RHB, {lhb_good_pct:.1f}% LHB")
+            
+            # Calculate handedness difference
+            rhb_pct_diff = rhb_bad_pct - rhb_good_pct
+            if abs(rhb_pct_diff) >= 15:
+                if rhb_pct_diff > 0:
+                    summary.append(f"\nThe bad start featured significantly more right-handed batters (+{rhb_pct_diff:.1f}%), which could be a factor if the pitcher struggles more against RHB.")
+                else:
+                    summary.append(f"\nThe bad start featured significantly fewer right-handed batters ({rhb_pct_diff:.1f}%), which could be a factor if the pitcher is typically stronger against RHB.")
+            
+            summary.append("\n**Success Rates by Batter Handedness:**")
+            summary.append(f"- vs. RHB: **{rhb_bad_ratio:.1f}%** in bad start vs **{rhb_good_ratio:.1f}%** in good start ({rhb_diff:+.1f}%)")
+            summary.append(f"- vs. LHB: **{lhb_bad_ratio:.1f}%** in bad start vs **{lhb_good_ratio:.1f}%** in good start ({lhb_diff:+.1f}%)")
+            
+            if abs(rhb_diff) >= 15 or abs(lhb_diff) >= 15:
+                if rhb_diff <= -15 and lhb_diff <= -15:
+                    summary.append("\nThe pitcher struggled against both right and left-handed batters in the bad start, suggesting a fundamental issue with pitch execution rather than matchup problems.")
+                elif rhb_diff <= -15:
+                    summary.append("\nThe pitcher had particular difficulty against right-handed batters in the bad start compared to the good start, suggesting potential issues with pitch selection or location against RHB.")
+                elif lhb_diff <= -15:
+                    summary.append("\nThe pitcher had particular difficulty against left-handed batters in the bad start compared to the good start, suggesting potential issues with pitch selection or location against LHB.")
+            else:
+                summary.append("\nThe pitcher's performance against both handedness of batters was relatively consistent between starts.")
+        
+        # 6. Recommendations
+        summary.append("\n## Recommendations for Improvement")
+        
+        recommendations = []
+        
+        # Pitch mix recommendations
+        if pitch_mix_diffs:
+            increased_pitches = [diff for diff in pitch_mix_diffs if diff['direction'] == 'increased']
+            decreased_pitches = [diff for diff in pitch_mix_diffs if diff['direction'] == 'decreased']
+            
+            if increased_pitches and increased_pitches[0]['diff'] >= 10:
+                pitch = increased_pitches[0]['pitch']
+                pitch_name = self.get_full_pitch_name(pitch)
+                recommendations.append(f"Return to a more balanced pitch mix like in the good start, reducing reliance on the {pitch_name} ({pitch})")
+            
+            if decreased_pitches and decreased_pitches[0]['diff'] >= 10:
+                pitch = decreased_pitches[0]['pitch']
+                pitch_name = self.get_full_pitch_name(pitch)
+                recommendations.append(f"Increase usage of the {pitch_name} ({pitch}) to levels seen in the good start")
+        
+        # Command/location recommendations
+        if zone_diff <= -5:
+            recommendations.append("Work on overall command to increase percentage of pitches in the strike zone, particularly early in counts")
+        elif zone_diff >= 5:
+            recommendations.append("Focus on quality strikes rather than just throwing in the zone; work the edges more effectively as in the good start")
+        
+        # Count management recommendations
+        if first_pitch_diff <= -10:
+            recommendations.append("Emphasize first-pitch strikes in bullpen sessions, potentially with simplified pitch selection on 0-0 counts")
+        
+        if hitter_diff >= 5:
+            recommendations.append("Develop a more effective approach when behind in counts to limit damage")
+        
+        # Add recommendations to summary
+        for i, rec in enumerate(recommendations):
+            summary.append(f"{i+1}. {rec}")
+        
+        # Add any additional recommendations based on velocity or handedness issues
+        if velocity_diffs and any(diff['diff'] >= 1.5 and diff['direction'] == 'lower' for diff in velocity_diffs):
+            summary.append(f"{len(recommendations)+1}. Monitor for fatigue or mechanical issues that could be causing velocity drop")
+        
+        if abs(rhb_diff) >= 15 or abs(lhb_diff) >= 15:
+            if rhb_diff <= -15:
+                summary.append(f"{len(recommendations)+1}. Refine approach against right-handed batters, particularly pitch selection and location strategies")
+            elif lhb_diff <= -15:
+                summary.append(f"{len(recommendations)+1}. Refine approach against left-handed batters, particularly pitch selection and location strategies")
+        
+        # Join all the summary elements
+        return '\n'.join(summary)
+        
+        if abs(strike_diff) >= 2:
+            if strike_diff < 0:
+                summary.append(f"**Strike Deficit:** {-strike_diff:.1f}% fewer strikes than in good starts")
+            else:
+                summary.append(f"**Strike Improvement:** {strike_diff:.1f}% more strikes than in good starts, suggesting command was not the primary issue")
+        
+        # Executive summary of key findings
+        summary.append("\n## Executive Summary: Why This Start Went Poorly")
+        
+        # Add key problems based on our analyses
+        key_problems = []
+        
+        # Check pitch mix for significant changes
+        pitch_mix_bad = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        pitch_mix_good = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        pitch_mix_diffs = []
+        for pitch in set(pitch_mix_bad.index).union(set(pitch_mix_good.index)):
+            bad_pct = pitch_mix_bad.get(pitch, 0)
+            good_pct = pitch_mix_good.get(pitch, 0)
+            diff = bad_pct - good_pct
+            
+            if abs(diff) >= 5 and bad_pct >= 5:  # Only include significant differences
+                direction = "increased" if diff > 0 else "decreased"
+                pitch_mix_diffs.append({
+                    'pitch': pitch,
+                    'diff': abs(diff),
+                    'direction': direction,
+                    'bad_pct': bad_pct,
+                    'good_pct': good_pct
+                })
+        
+        # Sort by magnitude of difference
+        pitch_mix_diffs.sort(key=lambda x: x['diff'], reverse=True)
+        
+        if pitch_mix_diffs:
+            pitch_mix_issue = "Pitch selection differed significantly from successful starts: "
+            mix_details = []
+            
+            for diff in pitch_mix_diffs[:2]:  # Focus on top 2 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                mix_details.append(f"{diff['direction']} {pitch_name} usage ({diff['bad_pct']:.1f}% vs {diff['good_pct']:.1f}% in good starts)")
+            
+            pitch_mix_issue += ", ".join(mix_details)
+            key_problems.append(pitch_mix_issue)
+        
+        # Check velocity issues
+        velocity_diffs = []
+        
+        for pitch_type in set(self.bad_game_data['pitch_type'].unique()).intersection(
+                set(self.good_games_data['pitch_type'].unique())):
+            bad_pitch_data = self.bad_game_data[self.bad_game_data['pitch_type'] == pitch_type]
+            good_pitch_data = self.good_games_data[self.good_games_data['pitch_type'] == pitch_type]
+            
+            if len(bad_pitch_data) >= 3 and len(good_pitch_data) >= 3:
+                bad_velo = bad_pitch_data['velocity'].mean()
+                good_velo = good_pitch_data['velocity'].mean()
+                diff = bad_velo - good_velo
+                
+                if abs(diff) >= 1.0:  # Only include meaningful differences
+                    direction = "higher" if diff > 0 else "lower"
+                    velocity_diffs.append({
+                        'pitch': pitch_type,
+                        'diff': abs(diff),
+                        'direction': direction,
+                        'bad_velo': bad_velo,
+                        'good_velo': good_velo
+                    })
+        
+        # Sort by magnitude of difference
+        velocity_diffs.sort(key=lambda x: x['diff'], reverse=True)
+        
+        if velocity_diffs:
+            velo_issue = "Velocity differences detected: "
+            velo_details = []
+            
+            for diff in velocity_diffs[:2]:  # Focus on top 2 differences
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                velo_details.append(f"{pitch_name} was {diff['diff']:.1f} mph {diff['direction']} ({diff['bad_velo']:.1f} mph vs {diff['good_velo']:.1f} mph in good starts)")
+            
+            velo_issue += ", ".join(velo_details)
+            key_problems.append(velo_issue)
+        
+        # Check location issues
+        # Compare good vs bad outcomes based on location
+        bad_outcomes = self.bad_game_data[self.bad_game_data['pitch_result'] == 'bad']
+        good_outcomes = self.bad_game_data[self.bad_game_data['pitch_result'] == 'good']
+        
+        if len(bad_outcomes) >= 5 and len(good_outcomes) >= 5:
+            # Analyze where bad outcomes occurred
+            bad_x_mean = bad_outcomes['location_x'].mean()
+            bad_z_mean = bad_outcomes['location_z'].mean()
+            
+            # Define strike zone boundaries 
+            zone_width = 1.7  # Strike zone width in feet
+            zone_height = 2.0  # Strike zone height in feet
+            zone_left = -zone_width/2
+            zone_right = zone_width/2
+            zone_bottom = 1.5  # Approximate bottom of strike zone
+            zone_top = zone_bottom + zone_height
+            
+            # Determine if there's a location pattern to bad outcomes
+            location_issue = None
+            
+            # Check if bad outcomes are in a specific part of the zone
+            in_zone = ((bad_x_mean >= zone_left) and (bad_x_mean <= zone_right) and 
+                      (bad_z_mean >= zone_bottom) and (bad_z_mean <= zone_top))
+            
+            if in_zone:
+                x_third = zone_width / 3
+                z_third = zone_height / 3
+                
+                x_pos = int((bad_x_mean - zone_left) / x_third)
+                z_pos = int((bad_z_mean - zone_bottom) / z_third)
+                
+                x_positions = ["inside", "middle", "outside"]
+                z_positions = ["low", "middle", "high"]
+                
+                if x_pos >= 0 and x_pos < 3 and z_pos >= 0 and z_pos < 3:
+                    location_issue = f"Command issues with {z_positions[z_pos]} {x_positions[x_pos]} pitches leading to hard contact"
+            else:
+                # Check if bad outcomes are outside the zone
+                if bad_x_mean < zone_left:
+                    location_issue = "Missed too often outside to arm side, leading to walks or favorable counts"
+                elif bad_x_mean > zone_right:
+                    location_issue = "Missed too often outside to glove side, leading to walks or favorable counts"
+                elif bad_z_mean < zone_bottom:
+                    location_issue = "Missed too often low, leading to walks or favorable counts"
+                elif bad_z_mean > zone_top:
+                    location_issue = "Elevated too many pitches, leading to hard contact"
+            
+            if location_issue:
+                key_problems.append(location_issue)
+        
+        # Check count management issues
+        bad_count_data = self.bad_game_data.copy()
+        good_count_data = self.good_games_data.copy()
+        
+        # Define count categories
+        hitter_counts = ['2-0', '3-0', '3-1', '2-1']
+        pitcher_counts = ['0-1', '0-2', '1-2', '2-2']
+        
+        # Calculate percentage of hitter/pitcher counts
+        bad_hitter_pct = sum(bad_count_data['count'].isin(hitter_counts)) / len(bad_count_data) * 100
+        good_hitter_pct = sum(good_count_data['count'].isin(hitter_counts)) / len(good_count_data) * 100
+        
+        bad_pitcher_pct = sum(bad_count_data['count'].isin(pitcher_counts)) / len(bad_count_data) * 100
+        good_pitcher_pct = sum(good_count_data['count'].isin(pitcher_counts)) / len(good_count_data) * 100
+        
+        hitter_diff = bad_hitter_pct - good_hitter_pct
+        pitcher_diff = bad_pitcher_pct - good_pitcher_pct
+        
+        if hitter_diff >= 5:
+            key_problems.append(f"Fell behind in the count more often ({bad_hitter_pct:.1f}% hitter's counts vs {good_hitter_pct:.1f}% in good starts)")
+        
+        if pitcher_diff <= -5:
+            key_problems.append(f"Failed to get ahead in the count as frequently ({bad_pitcher_pct:.1f}% pitcher's counts vs {good_pitcher_pct:.1f}% in good starts)")
+        
+        # Check first-pitch strike percentage
+        bad_first_pitch = bad_count_data[bad_count_data['count'] == '0-0']
+        good_first_pitch = good_count_data[good_count_data['count'] == '0-0']
+        
+        bad_first_strike_pct = sum(bad_first_pitch['strike_ball'] == 'strike') / len(bad_first_pitch) * 100 if len(bad_first_pitch) > 0 else 0
+        good_first_strike_pct = sum(good_first_pitch['strike_ball'] == 'strike') / len(good_first_pitch) * 100 if len(good_first_pitch) > 0 else 0
+        
+        first_pitch_diff = bad_first_strike_pct - good_first_strike_pct
+        
+        if first_pitch_diff <= -10:
+            key_problems.append(f"First-pitch strike percentage was significantly lower ({bad_first_strike_pct:.1f}% vs {good_first_strike_pct:.1f}% in good starts)")
+        
+        # Check performance against different batter handedness
+        rh_batters = bad_count_data[bad_count_data['stand'] == 'R']
+        lh_batters = bad_count_data[bad_count_data['stand'] == 'L']
+        
+        rh_good_batters = good_count_data[good_count_data['stand'] == 'R']
+        lh_good_batters = good_count_data[good_count_data['stand'] == 'L']
+        
+        # Calculate success ratios
+        # RHB
+        rhb_bad_good = sum(rh_batters['pitch_result'] == 'good')
+        rhb_bad_bad = sum(rh_batters['pitch_result'] == 'bad')
+        rhb_bad_total = rhb_bad_good + rhb_bad_bad
+        
+        rhb_good_good = sum(rh_good_batters['pitch_result'] == 'good')
+        rhb_good_bad = sum(rh_good_batters['pitch_result'] == 'bad')
+        rhb_good_total = rhb_good_good + rhb_good_bad
+        
+        rhb_bad_ratio = (rhb_bad_good / rhb_bad_total) * 100 if rhb_bad_total > 0 else 0
+        rhb_good_ratio = (rhb_good_good / rhb_good_total) * 100 if rhb_good_total > 0 else 0
+        
+        # LHB
+        lhb_bad_good = sum(lh_batters['pitch_result'] == 'good')
+        lhb_bad_bad = sum(lh_batters['pitch_result'] == 'bad')
+        lhb_bad_total = lhb_bad_good + lhb_bad_bad
+        
+        lhb_good_good = sum(lh_good_batters['pitch_result'] == 'good')
+        lhb_good_bad = sum(lh_good_batters['pitch_result'] == 'bad')
+        lhb_good_total = lhb_good_good + lhb_good_bad
+        
+        lhb_bad_ratio = (lhb_bad_good / lhb_bad_total) * 100 if lhb_bad_total > 0 else 0
+        lhb_good_ratio = (lhb_good_good / lhb_good_total) * 100 if lhb_good_total > 0 else 0
+        
+        # Check for significant handedness differences
+        rhb_diff = rhb_bad_ratio - rhb_good_ratio
+        lhb_diff = lhb_bad_ratio - lhb_good_ratio
+        
+        if rhb_diff <= -15 and len(rh_batters) >= 20:
+            key_problems.append(f"Struggled significantly against right-handed batters ({rhb_bad_ratio:.1f}% success vs {rhb_good_ratio:.1f}% in good starts)")
+        
+        if lhb_diff <= -15 and len(lh_batters) >= 20:
+            key_problems.append(f"Struggled significantly against left-handed batters ({lhb_bad_ratio:.1f}% success vs {lhb_good_ratio:.1f}% in good starts)")
+        
+        # Add key problems to summary
+        if key_problems:
+            for i, problem in enumerate(key_problems):
+                summary.append(f"{i+1}. {problem}")
+        else:
+            summary.append("No single factor stands out as the primary cause of the poor performance. The issues appear to be a combination of minor factors rather than any major deficiency.")
+        
+        # Add detailed analysis sections
+        summary.append("\n## Detailed Analysis")
+        
+        # 1. Pitch Mix Analysis
+        summary.append("\n### Pitch Mix Analysis")
+        
+        pitch_counts_bad = self.bad_game_data['pitch_type'].value_counts()
+        pitch_pcts_bad = self.bad_game_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        pitch_counts_good = self.good_games_data['pitch_type'].value_counts()
+        pitch_pcts_good = self.good_games_data['pitch_type'].value_counts(normalize=True) * 100
+        
+        # Create a table of pitch types
+        summary.append("\n| Pitch Type | Bad Start Usage | Good Starts Usage | Difference |")
+        summary.append("| ---------- | --------------- | ---------------- | ---------- |")
+        
+        for pitch in sorted(set(pitch_pcts_bad.index).union(set(pitch_pcts_good.index))):
+            bad_pct = pitch_pcts_bad.get(pitch, 0)
+            good_pct = pitch_pcts_good.get(pitch, 0)
+            diff = bad_pct - good_pct
+            
+            # Only include pitches with meaningful usage
+            if bad_pct >= 3 or good_pct >= 3:
+                full_name = self.get_full_pitch_name(pitch)
+                
+                # Format the difference with a sign
+                if diff > 0:
+                    diff_str = f"+{diff:.1f}%"
+                else:
+                    diff_str = f"{diff:.1f}%"
+                
+                summary.append(f"| {pitch} ({full_name}) | {bad_pct:.1f}% ({pitch_counts_bad.get(pitch, 0)}) | {good_pct:.1f}% ({pitch_counts_good.get(pitch, 0)}) | {diff_str} |")
+        
+        # Add narrative about pitch mix
+        if pitch_mix_diffs:
+            summary.append("\nSignificant differences in pitch usage were identified:")
+            
+            for diff in pitch_mix_diffs:
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                if diff['direction'] == 'increased':
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Usage was **{diff['diff']:.1f}%** higher than in successful starts. This could indicate:")
+                    
+                    # Provide potential explanations
+                    if diff['diff'] >= 10:
+                        summary.append("  - Over-reliance on this pitch, making the pitcher more predictable")
+                        summary.append("  - Abandoning other effective pitches that were working in previous starts")
+                        summary.append("  - Possible loss of feel for other pitches, forcing increased usage of this pitch")
+                else:
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Usage was **{diff['diff']:.1f}%** lower than in successful starts. This could indicate:")
+                    
+                    # Provide potential explanations
+                    if diff['diff'] >= 10:
+                        summary.append("  - Lack of confidence in a previously effective pitch")
+                        summary.append("  - Inability to command this pitch effectively in this start")
+                        summary.append("  - Strategic decision against the specific opponent that didn't work out")
+        
+        # 2. Velocity Analysis
+        summary.append("\n### Velocity Analysis")
+        
+        if velocity_diffs:
+            summary.append("\nVelocity differences were detected in the following pitches:")
+            
+            for diff in velocity_diffs:
+                pitch_name = self.get_full_pitch_name(diff['pitch'])
+                if diff['direction'] == 'lower':
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Velocity was **{diff['diff']:.1f} mph** lower than in successful starts ({diff['bad_velo']:.1f} mph vs {diff['good_velo']:.1f} mph).")
+                    
+                    # Provide potential explanations for velocity drop
+                    if diff['diff'] >= 1.5:
+                        summary.append("  - Potential causes: mechanical issues, fatigue, injury concern, or deliberately sacrificing velocity for command")
+                else:
+                    summary.append(f"- **{pitch_name} ({diff['pitch']})**: Velocity was **{diff['diff']:.1f} mph** higher than in successful starts ({diff['bad_velo']:.1f} mph vs {diff['good_velo']:.1f} mph).")
+                    
+                    # Provide potential explanations for velocity increase
+                    if diff['diff'] >= 1.5:
+                        summary.append("  - Potential causes: overthrowing, mechanical adjustments, or increased effort affecting command")
+        else:
+            summary.append("\nVelocity was consistent with successful starts, suggesting that reduced velocity was not a factor in the poor performance.")
+        
+        # Check for velocity degradation within the start
+        # Focus on fastball types
+        fastball_types = ['FF', 'FT', 'SI', 'FA']
+        primary_fb = None
+        
+        for fb_type in fastball_types:
+            if fb_type in self.bad_game_data['pitch_type'].values:
+                primary_fb = fb_type
+                break
+        
+        if primary_fb:
+            fb_pitches = self.bad_game_data[self.bad_game_data['pitch_type'] == primary_fb]
+            
+            if len(fb_pitches) >= 10:
+                # Split into first half and second half
+                halfway = len(fb_pitches) // 2
+                first_half = fb_pitches.iloc[:halfway]
+                second_half = fb_pitches.iloc[halfway:]
+                
+                first_velo = first_half['velocity'].mean()
+                second_velo = second_half['velocity'].mean()
+                velo_diff = first_velo - second_velo
+                
+                if velo_diff >= 1.0:
+                    summary.append(f"\nVelocity degradation was observed during the start. {self.get_full_pitch_name(primary_fb)} velocity dropped from {first_velo:.1f} mph in the first half to {second_velo:.1f} mph in the second half (-{velo_diff:.1f} mph).")
+                    summary.append("- This suggests fatigue was a factor, potentially due to high pitch counts early, mechanical issues, or underlying physical concerns.")
+                elif velo_diff <= -1.0:
+                    summary.append(f"\nVelocity actually increased during the start. {self.get_full_pitch_name(primary_fb)} velocity increased from {first_velo:.1f} mph in the first half to {second_velo:.1f} mph in the second half (+{-velo_diff:.1f} mph).")
+                    summary.append("- This suggests the pitcher may have been finding their rhythm or increasing effort later in the game, possibly at the expense of command.")
+        
+        # 3. Location Analysis
+        summary.append("\n### Location Analysis")
+        
+        # Compare strike zone percentages
+        zone_width = 1.7
+        zone_height = 2.0
+        zone_left = -zone_width/2
+        zone_right = zone_width/2
+        zone_bottom = 1.5
+        zone_top = zone_bottom + zone_height
+        
+        # Filter out rows with missing location data first
+        bad_valid_loc = self.bad_game_data[~self.bad_game_data['location_x'].isna() & 
+                                         ~self.bad_game_data['location_z'].isna()]
+        good_valid_loc = self.good_games_data[~self.good_games_data['location_x'].isna() & 
+                                            ~self.good_games_data['location_z'].isna()]
+        
+        # Calculate how many pitches were in the zone
+        if not bad_valid_loc.empty:
+            bad_in_zone = sum((bad_valid_loc['location_x'] >= zone_left) & 
+                             (bad_valid_loc['location_x'] <= zone_right) & 
+                             (bad_valid_loc['location_z'] >= zone_bottom) & 
+                             (bad_valid_loc['location_z'] <= zone_top))
+            bad_zone_pct = (bad_in_zone / len(bad_valid_loc)) * 100
+        else:
+            bad_in_zone = 0
+            bad_zone_pct = 0
+            
+        if not good_valid_loc.empty:
+            good_in_zone = sum((good_valid_loc['location_x'] >= zone_left) & 
+                              (good_valid_loc['location_x'] <= zone_right) & 
+                              (good_valid_loc['location_z'] >= zone_bottom) & 
+                              (good_valid_loc['location_z'] <= zone_top))
+            good_zone_pct = (good_in_zone / len(good_valid_loc)) * 100
+        else:
+            good_in_zone = 0
+            good_zone_pct = 0
+        
+        zone_diff = bad_zone_pct - good_zone_pct
+        
+        summary.append(f"\nIn the bad start, **{bad_zone_pct:.1f}%** of pitches were in the strike zone, compared to **{good_zone_pct:.1f}%** in good starts ({zone_diff:+.1f}%).")
+        
+        if zone_diff <= -5:
+            summary.append("- This significant reduction in zone percentage indicates command issues and contributes to falling behind in counts.")
+        elif zone_diff >= 5:
+            summary.append("- The higher zone percentage might indicate pitches were too hittable, catching too much of the plate rather than working the edges.")
+        
+        # Analyze hard hit balls location
+        # First filter out missing values
+        bad_pitches_with_launch = self.bad_game_data[~self.bad_game_data['launch_speed'].isna()]
+        bad_hard_contact = bad_pitches_with_launch[(bad_pitches_with_launch['pitch_result'] == 'bad') & 
+                                                 (bad_pitches_with_launch['launch_speed'] >= 95)]
+        
+        # Also ensure location data is valid
+        bad_hard_contact = bad_hard_contact[~bad_hard_contact['location_x'].isna() & 
+                                          ~bad_hard_contact['location_z'].isna()]
+        
+        if len(bad_hard_contact) >= 3:
+            # Analyze location of hard contact
+            hard_x_mean = bad_hard_contact['location_x'].mean()
+            hard_z_mean = bad_hard_contact['location_z'].mean()
+            
+            # Determine zone position
+            in_zone = ((hard_x_mean >= zone_left) and (hard_x_mean <= zone_right) and 
+                      (hard_z_mean >= zone_bottom) and (hard_z_mean <= zone_top))
+            
+            summary.append(f"\n**Hard Contact Analysis**: {len(bad_hard_contact)} pitches resulted in hard contact (exit velocity >= 95 mph).")
+            
+            if in_zone:
+                x_third = zone_width / 3
+                z_third = zone_height / 3
+                
+                x_pos = int((hard_x_mean - zone_left) / x_third)
+                z_pos = int((hard_z_mean - zone_bottom) / z_third)
+                
+                x_positions = ["inside", "middle", "outside"]
+                z_positions = ["low", "middle", "high"]
+                
+                if x_pos >= 0 and x_pos < 3 and z_pos >= 0 and z_pos < 3:
+                    hard_contact_zone = f"{z_positions[z_pos]} {x_positions[x_pos]}"
+                    summary.append(f"- Most hard contact came on pitches located {hard_contact_zone} in the zone.")
+                    summary.append(f"- This suggests the pitcher was either too predictable in this location or lacked deception/movement on pitches in this area.")
+            else:
+                if hard_x_mean < zone_left:
+                    summary.append("- Most hard contact surprisingly came on pitches off the plate inside, suggesting hitters were looking for this location.")
+                elif hard_x_mean > zone_right:
+                    summary.append("- Most hard contact surprisingly came on pitches off the plate outside, suggesting poor execution or hitters anticipating pitches in this location.")
+                elif hard_z_mean < zone_bottom:
+                    summary.append("- Most hard contact came on low pitches, suggesting breaking balls that didn't break enough or were hanging.")
+                elif hard_z_mean > zone_top:
+                    summary.append("- Most hard contact came on elevated pitches, suggesting fastballs that weren't located high enough or lacked movement.")
+            
+            # Analyze which pitch types got hit hard
+            hard_by_pitch = bad_hard_contact['pitch_type'].value_counts()
+            if not hard_by_pitch.empty:
+                worst_pitch = hard_by_pitch.index[0]
+                worst_pitch_name = self.get_full_pitch_name(worst_pitch)
+                worst_pitch_count = hard_by_pitch.iloc[0]
+                
+                summary.append(f"- The **{worst_pitch_name} ({worst_pitch})** was most susceptible to hard contact, accounting for {worst_pitch_count} of the {len(bad_hard_contact)} hard-hit balls.")
+        
+        # 4. Count Analysis
+        summary.append("\n### Count Analysis")
+        
+        # Calculate first-pitch strike
+        summary.append(f"\n**First Pitch Strike**: {bad_first_strike_pct:.1f}% in bad start vs {good_first_strike_pct:.1f}% in good starts ({first_pitch_diff:+.1f}%)")
+        
+        if first_pitch_diff <= -10:
+            summary.append("- This substantial decrease in first-pitch strikes put the pitcher behind in counts more frequently, forcing more predictable pitch selection.")
+        
+        # Count distributions
+        summary.append("\n**Count Distribution**:")
+        summary.append(f"- Hitter's Counts: {bad_hitter_pct:.1f}% in bad start vs {good_hitter_pct:.1f}% in good starts ({hitter_diff:+.1f}%)")
+        summary.append(f"- Pitcher's Counts: {bad_pitcher_pct:.1f}% in bad start vs {good_pitcher_pct:.1f}% in good starts ({pitcher_diff:+.1f}%)")
+        
+        if hitter_diff >= 5 or pitcher_diff <= -5:
+            summary.append("\nThe count distribution was significantly worse than in good starts, forcing the pitcher to throw more predictable pitches and reducing effectiveness.")
+        
+        # 5. Handedness Analysis
+        summary.append("\n### Performance by Batter Handedness")
+        
+        rhb_pct = len(rh_batters) / len(self.bad_game_data) * 100
+        lhb_pct = len(lh_batters) / len(self.bad_game_data) * 100
+        
+        summary.append(f"\nIn this start, the pitcher faced {rhb_pct:.1f}% right-handed batters and {lhb_pct:.1f}% left-handed batters.")
+        
+        summary.append("\n**Success Rates**:")
+        summary.append(f"- vs. RHB: {rhb_bad_ratio:.1f}% in bad start vs {rhb_good_ratio:.1f}% in good starts ({rhb_diff:+.1f}%)")
+        summary.append(f"- vs. LHB: {lhb_bad_ratio:.1f}% in bad start vs {lhb_good_ratio:.1f}% in good starts ({lhb_diff:+.1f}%)")
+        
+        if abs(rhb_diff) >= 15 or abs(lhb_diff) >= 15:
+            if rhb_diff <= -15 and lhb_diff <= -15:
+                summary.append("\nThe pitcher struggled against both right and left-handed batters in this start, suggesting a fundamental issue with pitch execution rather than matchup problems.")
+            elif rhb_diff <= -15:
+                summary.append("\nThe pitcher had particular difficulty against right-handed batters in this start compared to their usual performance, suggesting potential issues with pitch selection or location against RHB.")
+            elif lhb_diff <= -15:
+                summary.append("\nThe pitcher had particular difficulty against left-handed batters in this start compared to their usual performance, suggesting potential issues with pitch selection or location against LHB.")
+        
+        # 6. Recommendations
+        summary.append("\n## Recommendations for Improvement")
+        
+        recommendations = []
+        
+        # Pitch mix recommendations
+        if pitch_mix_diffs:
+            increased_pitches = [diff for diff in pitch_mix_diffs if diff['direction'] == 'increased']
+            decreased_pitches = [diff for diff in pitch_mix_diffs if diff['direction'] == 'decreased']
+            
+            if increased_pitches and increased_pitches[0]['diff'] >= 10:
+                pitch = increased_pitches[0]['pitch']
+                pitch_name = self.get_full_pitch_name(pitch)
+                recommendations.append(f"Reduce reliance on the {pitch_name} ({pitch}) and return to the more balanced pitch mix used in successful starts")
+            
+            if decreased_pitches and decreased_pitches[0]['diff'] >= 10:
+                pitch = decreased_pitches[0]['pitch']
+                pitch_name = self.get_full_pitch_name(pitch)
+                recommendations.append(f"Increase usage of the {pitch_name} ({pitch}) to levels seen in successful starts")
+        
+        # Command/location recommendations
+        if zone_diff <= -5:
+            recommendations.append("Work on overall command to increase percentage of pitches in the strike zone, particularly early in counts")
+        elif zone_diff >= 5:
+            recommendations.append("Focus on quality strikes rather than just throwing in the zone; work the edges more effectively")
+        
+        # Count management recommendations
+        if first_pitch_diff <= -10:
+            recommendations.append("Emphasize first-pitch strikes in bullpen sessions, potentially with simplified pitch selection on 0-0 counts")
+        
+        if hitter_diff >= 5:
+            recommendations.append("Develop a more effective approach when behind in counts to limit damage")
+        
+        # Add recommendations to summary
+        for i, rec in enumerate(recommendations):
+            summary.append(f"{i+1}. {rec}")
+        
+        # Add any additional recommendations based on velocity or handedness issues
+        if velocity_diffs and any(diff['diff'] >= 1.5 and diff['direction'] == 'lower' for diff in velocity_diffs):
+            summary.append(f"{len(recommendations)+1}. Monitor for fatigue or mechanical issues that could be causing velocity drop")
+        
+        if abs(rhb_diff) >= 15 or abs(lhb_diff) >= 15:
+            if rhb_diff <= -15:
+                summary.append(f"{len(recommendations)+1}. Refine approach against right-handed batters, particularly pitch selection and location strategies")
+            elif lhb_diff <= -15:
+                summary.append(f"{len(recommendations)+1}. Refine approach against left-handed batters, particularly pitch selection and location strategies")
+        
+        # Join all the summary elements
+        return '\n'.join(summary)
+    
+    def run_analysis(self):
+        """Run the full analysis workflow"""
+        # Get pitcher name
+        name = input("Enter pitcher name to search: ")
+        search_results = self.search_pitcher(name)
+        
+        if not search_results:
+            print("No players found.")
+            return
+            
+        self.select_pitcher(search_results)
+        
+        # Find recent games and categorize them
+        print("\nSearching for recent games to analyze...")
+        games = self.find_recent_games()
+        
+        if not games:
+            print("Failed to find and categorize games.")
+            return
+        
+        # Fetch data for the selected games
+        success = self.fetch_all_game_data()
+        
+        if not success:
+            print("Failed to fetch game data for analysis.")
+            return
+        
+        # Generate all the visualizations
+        print("\nGenerating visualizations for comparing bad and good starts...")
+        
+        # Create output directory if it doesn't exist
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
+            print(f"Created output directory: {self.output_dir}")
+        
+        # Generate visualizations
+        self.create_pitch_mix_comparison()
+        self.create_location_comparison()
+        self.create_velocity_comparison()
+        self.create_spin_rate_comparison()
+        self.create_outcome_analysis()
+        self.create_count_analysis()
+        self.analyze_opposing_batters()
+        
+        # Generate the performance summary
+        print("\nGenerating comprehensive performance analysis...")
+        summary = self.generate_performance_summary()
+        
+        # Save the summary to a markdown file
+        summary_path = os.path.join(self.output_dir, f"{self.pitcher['fullName'].replace(' ', '_')}_performance_analysis.md")
+        
+        with open(summary_path, 'w') as f:
+            f.write(summary)
+            
+        print(f"\nAnalysis complete! All outputs saved to {self.output_dir}")
+        print(f"Performance analysis saved to {summary_path}")
+        
+        return summary
+
+# For use in a Jupyter notebook or command line
+def analyze_bad_start():
+    """Run the bad start analysis"""
+    analyzer = MLBPitcherBadStartAnalyzer()
+    return analyzer.run_analysis()
+
+if __name__ == "__main__":
+    analyzer = MLBPitcherBadStartAnalyzer()
+    analyzer.run_analysis()
